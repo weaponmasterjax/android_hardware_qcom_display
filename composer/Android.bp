@@ -80,6 +80,8 @@ cc_binary {
         any @ value: [
             "//" + value + ":libpwirisfeature",
             "//" + value + ":libpwirishalwrapper",
+            // For auto ABYP→PT via IIris::irisConfigureSet(56, 0)
+            "vendor.pixelworks.hardware.display@1.0",
         ],
         default: [],
     }),

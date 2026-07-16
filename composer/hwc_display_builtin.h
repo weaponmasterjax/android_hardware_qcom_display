@@ -188,6 +188,13 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   void LoadMixedModePerfHintThreshold();
   void HandleLargeCompositionHint(bool release);
   void ReqPerfHintRelease();
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  void MaybeRequestIrisPt();
+  void MaybeRequestIrisVideoMemc();
+  void IrisNotifyDsiClkEnabled() override;
+#endif
+#endif
 
   // SyncTask methods.
   void OnTask(const LayerStitchTaskCode &task_code,
@@ -214,6 +221,31 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
 
   bool qsync_enabled_ = false;
   bool qsync_reconfigured_ = false;
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Auto ABYP→PT state machine (see MaybeRequestIrisPt).
+  // SDM short-circuits SetDynamicDSIClock if it thinks rate is already set while
+  // kernel cached_clk_rate can still be 0 — bounce default→PT rate before ioctl.
+  bool iris_pending_pt_ = false;
+  bool iris_pt_requested_ = false;
+  uint32_t iris_pt_present_count_ = 0;
+  uint32_t iris_pt_phase_ = 0;       // 0 bounce-low, 1 arm-high, 2 wait-latch, 3 fire
+  uint32_t iris_pt_phase_frame_ = 0;
+  uint32_t iris_pt_attempts_ = 0;
+  static constexpr uint32_t kIrisPtMaxAttempts = 4;
+  static constexpr uint32_t kIrisPtLatchFrames = 24;  // after arming high rate
+  static constexpr uint64_t kIrisPtBitClkHz = 1056000000ULL;
+  static constexpr uint64_t kIrisDefaultBitClkHz = 1113600000ULL;
+
+  // Auto video MEMC (stock Iris7 MemcEn subset). Needs layer identity path + PT.
+  // persist.vendor.display.iris.auto_memc=0 disables. Video only — not games.
+  bool iris_memc_on_ = false;
+  uint32_t iris_memc_video_frames_ = 0;
+  uint32_t iris_memc_novideo_frames_ = 0;
+  static constexpr uint32_t kIrisMemcEnterFrames = 8;
+  static constexpr uint32_t kIrisMemcExitFrames = 16;
+#endif
+#endif
   // Members for Color sampling feature
   DisplayError HistogramEvent(int fd, uint32_t blob_id) override;
   histogram::HistogramCollector histogram;

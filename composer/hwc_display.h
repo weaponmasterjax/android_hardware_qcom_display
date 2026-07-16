@@ -360,6 +360,12 @@ class HWCDisplay : public DisplayEventHandler {
   virtual DisplayError GetSupportedDSIClock(std::vector<uint64_t> *bitclk) {
     return kErrorNotSupported;
   }
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Service SetDsiClk(enable=1) after a failed BypassToPt — re-arm auto-PT.
+  virtual void IrisNotifyDsiClkEnabled() {}
+#endif
+#endif
   virtual HWC2::Error UpdateDisplayId(hwc2_display_t id) {
     return HWC2::Error::Unsupported;
   }

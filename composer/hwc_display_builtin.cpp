@@ -51,6 +51,13 @@
 #include "hwc_debugger.h"
 #include "hwc_session.h"
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+#include <vendor/pixelworks/hardware/display/1.0/IIris.h>
+using ::vendor::pixelworks::hardware::display::V1_0::IIris;
+#endif
+#endif
+
 #define __CLASS__ "HWCDisplayBuiltIn"
 
 namespace sdm {
@@ -360,8 +367,25 @@ HWC2::Error HWCDisplayBuiltIn::CommitStitchLayers() {
 }
 
 HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown) {
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Notify Iris before panel power transition (stock HWCSessionIris7 / wrapper path).
+  if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+    iris7->BeforeSetPowerMode(static_cast<unsigned long>(id_), static_cast<int>(mode), teardown);
+  }
+#endif
+#endif
+
   auto status = HWCDisplay::SetPowerMode(mode, teardown);
   if (status != HWC2::Error::None) {
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+    // Still run After on failure so Iris does not stay half-transitioned.
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->AfterSetPowerMode(static_cast<unsigned long>(id_), static_cast<int>(mode), teardown);
+    }
+#endif
+#endif
     return status;
   }
   DLOGV_IF(kTagClient, "Setting Power State as \'%s\' for %d-%d", (mode == HWC2::PowerMode::On)?
@@ -389,6 +413,42 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
   display_intf_->GetConfig(&fixed_info);
   is_cmd_mode_ = fixed_info.is_cmdmode;
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+    iris7->AfterSetPowerMode(static_cast<unsigned long>(id_), static_cast<int>(mode), teardown);
+  }
+  // Pre-arm Iris7P PT bit-clk after panel on. Kernel iris_abyp_switch_proc requires
+  // cached_clk_rate == bit_clk_list.rates[1] (1056000000 on Ace 3); without this,
+  // irisServiceModeSwitchBypassToPt times out and display stays SLEEP-ABYPASS.
+  // Dyn clock latches on subsequent commit (Present path).
+  if (mode == HWC2::PowerMode::On) {
+    std::vector<uint64_t> rates;
+    uint64_t target = 1056000000ULL;
+    if (GetSupportedDSIClock(&rates) == kErrorNone && rates.size() > 1) {
+      target = rates[1];
+    } else if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+      target = rates.back();
+    }
+    DisplayError cerr = SetDynamicDSIClock(target);
+    DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
+    // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
+    iris_pending_pt_ = true;
+    iris_pt_requested_ = false;
+    iris_pt_present_count_ = 0;
+    iris_pt_phase_ = 0;
+    iris_pt_phase_frame_ = 0;
+    iris_pt_attempts_ = 0;
+  } else if (mode == HWC2::PowerMode::Off || mode == HWC2::PowerMode::DozeSuspend) {
+    iris_pending_pt_ = false;
+    iris_pt_requested_ = false;
+    iris_pt_present_count_ = 0;
+    iris_pt_phase_ = 0;
+    iris_pt_attempts_ = 0;
+  }
+#endif
+#endif
+
   return HWC2::Error::None;
 }
 
@@ -413,9 +473,41 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
       return status;
     }
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+    // Feed Iris the SDM layer stack (MEMC needs video/game layers via BuildLayerStack).
+    int iris_bc0 = 0, iris_bc1 = 0, iris_bc2 = 0;
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->BeforeCommitLayerStack(0, 0, iris_bc0, iris_bc1, iris_bc2);
+    }
+#endif
+#endif
     status = CommitLayerStack();
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->AfterCommitLayerStack(0, 0, iris_bc0, iris_bc1);
+    }
+#endif
+#endif
     if (status == HWC2::Error::None) {
       status = PostCommitLayerStack(out_retire_fence);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+      if (status == HWC2::Error::None) {
+        if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+          int build_out = 0;
+          // Stock Present path: build Iris layer view then present (enables MEMC allow checks).
+          iris7->BuildLayerStack(0, 0, &layer_stack_, &build_out);
+          bool present_flag = false;
+          iris7->Present(0, 0, present_flag, &layer_stack_);
+          iris7->PresentDisplay(static_cast<unsigned long>(id_));
+        }
+        MaybeRequestIrisPt();
+        MaybeRequestIrisVideoMemc();
+      }
+#endif
+#endif
     }
   }
 
@@ -425,6 +517,149 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
   }
   return status;
 }
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+void HWCDisplayBuiltIn::IrisNotifyDsiClkEnabled() {
+  // Service enable=1 runs only after BypassToPt timeout — schedule another PT try
+  // now that it is pushing the high bit-clk path.
+  DLOGI("Pxlw Iris7: IrisNotifyDsiClkEnabled — re-arm auto-PT after service enable=1");
+  iris_pending_pt_ = true;
+  iris_pt_requested_ = false;
+  iris_pt_present_count_ = 0;
+  iris_pt_phase_ = 2;  // high rate is being set by SetIrisDynamicDsiClk; wait latch
+  iris_pt_phase_frame_ = 0;
+}
+
+void HWCDisplayBuiltIn::MaybeRequestIrisPt() {
+  if (!iris_pending_pt_ || iris_pt_requested_) {
+    return;
+  }
+  if (iris_pt_attempts_ >= kIrisPtMaxAttempts) {
+    iris_pending_pt_ = false;
+    DLOGW("Pxlw Iris7: auto-PT gave up after %u attempts", iris_pt_attempts_);
+    return;
+  }
+
+  iris_pt_present_count_++;
+
+  // Phase 0: force default rate so SDM cannot short-circuit the next high-rate set
+  // (userspace may already think clk==1056 while kernel cached_clk_rate is still 0).
+  if (iris_pt_phase_ == 0) {
+    SetDynamicDSIClock(kIrisDefaultBitClkHz);
+    iris_pt_phase_ = 1;
+    iris_pt_phase_frame_ = iris_pt_present_count_;
+    DLOGI("Pxlw Iris7: auto-PT phase0 bounce to default bit-clk");
+    return;
+  }
+
+  // Phase 1: arm PT bit-clk (rates[1] / 1056000000)
+  if (iris_pt_phase_ == 1) {
+    if (iris_pt_present_count_ - iris_pt_phase_frame_ < 2) {
+      return;
+    }
+    SetDynamicDSIClock(kIrisPtBitClkHz);
+    iris_pt_phase_ = 2;
+    iris_pt_phase_frame_ = iris_pt_present_count_;
+    DLOGI("Pxlw Iris7: auto-PT phase1 arm PT bit-clk %" PRIu64, kIrisPtBitClkHz);
+    return;
+  }
+
+  // Phase 2: wait for dyn bit-clk kickoff to fill kernel cached_clk_rate
+  if (iris_pt_phase_ == 2) {
+    if (iris_pt_present_count_ - iris_pt_phase_frame_ < kIrisPtLatchFrames) {
+      return;
+    }
+    iris_pt_phase_ = 3;
+  }
+
+  // Phase 3: irisConfigureSet(56, 0) → BypassToPt
+  auto iris = IIris::getService();
+  if (iris == nullptr) {
+    DLOGW("Pxlw Iris7: auto-PT IIris getService failed (retry)");
+    iris_pt_phase_ = 0;  // restart bounce
+    iris_pt_phase_frame_ = iris_pt_present_count_;
+    return;
+  }
+
+  android::hardware::hidl_vec<int32_t> vals;
+  vals.resize(1);
+  vals[0] = 0;
+  auto ret = iris->irisConfigureSet(56 /* IRIS_ANALOG_BYPASS_MODE */, vals);
+  iris_pt_attempts_++;
+  iris_pt_requested_ = true;
+  iris_pending_pt_ = false;
+  if (!ret.isOk()) {
+    DLOGE("Pxlw Iris7: auto-PT irisConfigureSet transport failed: %s",
+          ret.description().c_str());
+    return;
+  }
+  DLOGI("Pxlw Iris7: auto-PT irisConfigureSet(56, 0) status=%d attempt=%u after %u presents",
+        int32_t(ret), iris_pt_attempts_, iris_pt_present_count_);
+}
+
+void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
+  // Stock HWC owns MemcEn; type 258 alone without layers freezes. Layer identity is
+  // wired; this is the minimal video enter/exit (SET_HDR_FORMAL / formal MEMC=10).
+  // Kill-switch: setprop persist.vendor.display.iris.auto_memc 0
+  char prop[PROPERTY_VALUE_MAX] = {};
+  property_get("persist.vendor.display.iris.auto_memc", prop, "1");
+  if (prop[0] == '0') {
+    return;
+  }
+
+  // Do not fight the ABYP→PT state machine. Once PT is stable (or already on), proceed.
+  if (iris_pending_pt_) {
+    return;
+  }
+
+  const bool video = layer_stack_.flags.video_present;
+  if (video) {
+    iris_memc_video_frames_++;
+    iris_memc_novideo_frames_ = 0;
+  } else {
+    iris_memc_novideo_frames_++;
+    iris_memc_video_frames_ = 0;
+  }
+
+  const bool want_on = video && iris_memc_video_frames_ >= kIrisMemcEnterFrames;
+  const bool want_off = !video && iris_memc_on_ &&
+                        iris_memc_novideo_frames_ >= kIrisMemcExitFrames;
+  if (!want_on && !want_off) {
+    return;
+  }
+  if (want_on && iris_memc_on_) {
+    return;
+  }
+
+  auto iris = IIris::getService();
+  if (iris == nullptr) {
+    DLOGW("Pxlw Iris7: auto-MEMC IIris getService failed");
+    return;
+  }
+
+  // irisConfig 258 4 <formal> -1 <scene> -1
+  // formal: HDR_FORMAL_MEMC=10, off=0; scene: video=0 (not game=2).
+  android::hardware::hidl_vec<int32_t> vals;
+  vals.resize(4);
+  vals[0] = want_on ? 10 : 0;
+  vals[1] = -1;
+  vals[2] = 0;
+  vals[3] = -1;
+  auto ret = iris->irisConfigureSet(258 /* SET_HDR_FORMAL */, vals);
+  if (!ret.isOk()) {
+    DLOGE("Pxlw Iris7: auto-MEMC irisConfigureSet transport failed: %s",
+          ret.description().c_str());
+    return;
+  }
+  iris_memc_on_ = want_on;
+  DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0) status=%d "
+        "video_frames=%u",
+        want_on ? "ON" : "OFF", vals[0], int32_t(ret),
+        want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_);
+}
+#endif
+#endif
 
 void HWCDisplayBuiltIn::PostCommitStitchLayers() {
   if (disable_layer_stitch_) {
@@ -476,15 +711,16 @@ HWC2::Error HWCDisplayBuiltIn::SetColorModeWithRenderIntent(ColorMode mode, Rend
   }
 
 #ifdef PXLW_IRIS
-  auto *iris_wrapper = pxlw::PxlwIrisWrapper::GetInstance();
-  if (iris_wrapper) {
+  if (auto *iris_base = pxlw::PxlwIrisWrapper::GetInstance()) {
 #ifdef SUPPORTS_PXLW_IRIS7
-    reinterpret_cast<pxlw::PxlwIris7Wrapper *>(iris_wrapper)
+    if (auto *iris7 = pxlw::AsIris7Wrapper(iris_base)) {
+      iris7->SetColorModeWithRenderIntent(0, 0, static_cast<int>(mode), static_cast<int>(intent));
+    }
 #else
-    reinterpret_cast<pxlw::PxlwSoftirisWrapper *>(iris_wrapper)
+    if (auto *soft = pxlw::AsSoftirisWrapper(iris_base)) {
+      soft->SetColorModeWithRenderIntent(0, 0, static_cast<int>(mode), static_cast<int>(intent));
+    }
 #endif
-        ->SetColorModeWithRenderIntent(0, 0, static_cast<int32_t>(mode),
-                                       static_cast<int32_t>(intent));
   }
 #endif
 

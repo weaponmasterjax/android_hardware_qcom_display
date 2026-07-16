@@ -581,6 +581,14 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   android::status_t GetDsiClk(const android::Parcel *input_parcel, android::Parcel *output_parcel);
   android::status_t GetSupportedDsiClk(const android::Parcel *input_parcel,
                                        android::Parcel *output_parcel);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Pixelworks Iris: service requests high bit-clk before ABYP→PT (kernel requires
+  // cached_clk_rate == bit_clk_list.rates[1], e.g. 1056000000 on Ace 3).
+  static bool IrisSetDsiClk(void *cookie, bool enable);
+  bool SetIrisDynamicDsiClk(bool enable);
+#endif
+#endif
   android::status_t SetFrameTriggerMode(const android::Parcel *input_parcel);
   android::status_t SetPanelLuminanceAttributes(const android::Parcel *input_parcel);
   android::status_t setColorSamplingEnabled(const android::Parcel *input_parcel);

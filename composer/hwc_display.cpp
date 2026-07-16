@@ -51,6 +51,10 @@
 #include "hwc_tonemapper.h"
 #include "hwc_session.h"
 
+#ifdef PXLW_IRIS
+#include <pxlw_iris_wrapper.h>
+#endif
+
 #ifdef QTI_BSP
 #include <hardware/display_defs.h>
 #endif
@@ -624,6 +628,20 @@ HWC2::Error HWCDisplay::CreateLayer(hwc2_layer_t *out_layer_id) {
   geometry_changes_ |= GeometryChanges::kAdded;
   layer_stack_invalid_ = true;
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Stock Iris HWC: CreateLayer so IrisService builds IrisLayer for checkEnterMemcAllow.
+  // Primary builtin only — virtual/external layers must not pollute Iris scenario detect.
+  if (type_ == kBuiltIn) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->CreateLayer(static_cast<unsigned long>(id_),
+                         static_cast<unsigned long>(*out_layer_id));
+      iris7->SetLayerSetEmpty(0, 0, false);
+    }
+  }
+#endif
+#endif
+
   return HWC2::Error::None;
 }
 
@@ -659,6 +677,20 @@ HWC2::Error HWCDisplay::DestroyLayer(hwc2_layer_t layer_id) {
 
   geometry_changes_ |= GeometryChanges::kRemoved;
   layer_stack_invalid_ = true;
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (type_ == kBuiltIn) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->DestroyLayer(static_cast<unsigned long>(id_),
+                          static_cast<unsigned long>(layer_id));
+      if (layer_set_.empty()) {
+        iris7->SetLayerSetEmpty(0, 0, true);
+      }
+    }
+  }
+#endif
+#endif
 
   return HWC2::Error::None;
 }
@@ -916,6 +948,16 @@ HWC2::Error HWCDisplay::SetLayerZOrder(hwc2_layer_t layer_id, uint32_t z) {
 
   layer->SetLayerZOrder(z);
   layer_set_.emplace(layer);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (type_ == kBuiltIn) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->SetLayerZOrder(static_cast<unsigned long>(id_),
+                            static_cast<unsigned long>(layer_id), z);
+    }
+  }
+#endif
+#endif
   return HWC2::Error::None;
 }
 
@@ -1264,6 +1306,17 @@ HWC2::Error HWCDisplay::SetClientTarget(buffer_handle_t target, shared_ptr<Fence
   client_acquire_fence_ = acquire_fence;
   client_dataspace_     = dataspace;
   client_damage_region_ = damage;
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Stock Present path also marks client target for Iris composition bookkeeping.
+  if (type_ == kBuiltIn) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->SetClientTarget(static_cast<unsigned long>(id_), -1);
+    }
+  }
+#endif
+#endif
 
   return HWC2::Error::None;
 }
@@ -2478,6 +2531,15 @@ int HWCDisplay::SetActiveDisplayConfig(uint32_t config) {
   }
 
   SetActiveConfigIndex(config);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+    DisplayConfigVariableInfo info = {};
+    GetDisplayAttributesForConfig(INT(config), &info);
+    iris7->SetActiveConfig(0, 0, config, &info);
+  }
+#endif
+#endif
   return 0;
 }
 
@@ -2747,6 +2809,16 @@ void HWCDisplay::UpdateActiveConfig() {
     DLOGI("Failed to set %d config", INT(pending_config_index_));
   } else {
     SetActiveConfigIndex(pending_config_index_);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+    // Push timing to Iris when config actually applies (stock SetActiveConfigToIrisWrapper).
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      DisplayConfigVariableInfo info = {};
+      GetDisplayAttributesForConfig(INT(pending_config_index_), &info);
+      iris7->SetActiveConfig(0, 0, static_cast<unsigned int>(pending_config_index_), &info);
+    }
+#endif
+#endif
   }
 
   // Reset pending config.
