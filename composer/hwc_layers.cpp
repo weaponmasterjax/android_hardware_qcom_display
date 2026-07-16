@@ -64,6 +64,12 @@
 #include <cmath>
 #include <gr_utils.h>
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+#include <pxlw_iris_wrapper.h>
+#endif
+#endif
+
 #ifdef UDFPS_ZPOS
 #include <display/drm/sde_drm.h>
 #endif
@@ -573,6 +579,19 @@ HWC2::Error HWCLayer::SetLayerCompositionType(HWC2::Composition type) {
       return HWC2::Error::Unsupported;
   }
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Pixelworks LayerCompositionType: GPU=0, HWC=2 (types.hal).
+  if (display_id_ == 0) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      int iris_comp = (type == HWC2::Composition::Client) ? 0 : 2;
+      iris7->SetLayerCompositionType(static_cast<unsigned long>(display_id_),
+                                     static_cast<unsigned long>(id_), iris_comp);
+    }
+  }
+#endif
+#endif
+
   return HWC2::Error::None;
 }
 
@@ -599,6 +618,18 @@ HWC2::Error HWCLayer::SetLayerDisplayFrame(hwc_rect_t frame) {
     geometry_changes_ |= kDisplayFrame;
     dst_rect_ = dst_rect;
   }
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (display_id_ == 0) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      hwc_rect r = {frame.left, frame.top, frame.right, frame.bottom};
+      iris7->SetLayerDisplayFrame(static_cast<unsigned long>(display_id_),
+                                  static_cast<unsigned long>(id_), r);
+    }
+  }
+#endif
+#endif
 
   return HWC2::Error::None;
 }
@@ -657,6 +688,20 @@ HWC2::Error HWCLayer::SetLayerSourceCrop(hwc_frect_t crop) {
     layer_->src_rect = src_rect;
   }
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (display_id_ == 0) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      // Iris wrapper takes integer hwc_rect (stock rounds float crop).
+      hwc_rect r = {static_cast<int>(roundf(crop.left)), static_cast<int>(roundf(crop.top)),
+                    static_cast<int>(roundf(crop.right)), static_cast<int>(roundf(crop.bottom))};
+      iris7->SetLayerSourceCrop(static_cast<unsigned long>(display_id_),
+                                static_cast<unsigned long>(id_), r);
+    }
+  }
+#endif
+#endif
+
   return HWC2::Error::None;
 }
 
@@ -700,6 +745,17 @@ HWC2::Error HWCLayer::SetLayerTransform(HWC2::Transform transform) {
     geometry_changes_ |= kTransform;
     layer_transform_ = layer_transform;
   }
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  if (display_id_ == 0) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      iris7->SetLayerTransform(static_cast<unsigned long>(display_id_),
+                               static_cast<unsigned long>(id_), static_cast<int>(transform));
+    }
+  }
+#endif
+#endif
 
   return HWC2::Error::None;
 }

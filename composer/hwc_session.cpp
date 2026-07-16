@@ -46,6 +46,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <dlfcn.h>
 
 #include "hwc_buffer_allocator.h"
 #include "hwc_session.h"
@@ -1084,7 +1085,21 @@ int32_t HWCSession::SetLayerBlendMode(hwc2_display_t display, hwc2_layer_t layer
 int32_t HWCSession::SetLayerBuffer(hwc2_display_t display, hwc2_layer_t layer,
                                    buffer_handle_t buffer,
                                    const shared_ptr<Fence> &acquire_fence) {
-  return CallLayerFunction(display, layer, &HWCLayer::SetLayerBuffer, buffer, acquire_fence);
+  auto status =
+      CallLayerFunction(display, layer, &HWCLayer::SetLayerBuffer, buffer, acquire_fence);
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // SF layers only (not client_target). Feeds Iris BufferInfo for video MEMC allow.
+  if (status == HWC2_ERROR_NONE && display == HWC_DISPLAY_PRIMARY && buffer) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      const native_handle_t *handle = reinterpret_cast<const native_handle_t *>(buffer);
+      iris7->SetLayerBuffer(static_cast<unsigned long>(display),
+                            static_cast<unsigned long>(layer), handle, -1);
+    }
+  }
+#endif
+#endif
+  return status;
 }
 
 int32_t HWCSession::SetLayerColor(hwc2_display_t display, hwc2_layer_t layer, hwc_color_t color) {
@@ -2709,6 +2724,59 @@ android::status_t HWCSession::SetDsiClk(const android::Parcel *input_parcel) {
   return hwc_display_[disp_id]->SetDynamicDSIClock(clk);
 }
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+bool HWCSession::IrisSetDsiClk(void *cookie, bool enable) {
+  auto *session = reinterpret_cast<HWCSession *>(cookie);
+  if (!session) {
+    return false;
+  }
+  return session->SetIrisDynamicDsiClk(enable);
+}
+
+bool HWCSession::SetIrisDynamicDsiClk(bool enable) {
+  // Iris7P kernel iris_abyp_switch_proc() refuses PASS_THROUGH unless
+  // display->cached_clk_rate == panel bit_clk_list.rates[1] (Ace 3: 1056000000).
+  //
+  // Live BypassToPt sequence (libpwirisservicei7p):
+  //   1) SetDsiClkCB(enable=0)  → was rates[0]=1113600000
+  //   2) irisConfigureIoctl(56→PT) → FAIL need 1056000000
+  //   3) timeout, then SetDsiClkCB(enable=1) → 1056000000 (too late)
+  // enable=0 must not force default bit-clk before the PT ioctl.
+  // enable=1 arms rates[1]; enable=0 is a no-op (keep post-On PT rate).
+  if (!enable) {
+    DLOGI("Pxlw Iris7: SetIrisDynamicDsiClk enable=0 — no-op (keep PT bit-clk)");
+    return true;
+  }
+
+  SEQUENCE_WAIT_SCOPE_LOCK(locker_[HWC_DISPLAY_PRIMARY]);
+  auto *disp = hwc_display_[HWC_DISPLAY_PRIMARY];
+  if (!disp) {
+    DLOGW("Pxlw Iris7: SetIrisDynamicDsiClk: no primary display");
+    return false;
+  }
+
+  std::vector<uint64_t> rates;
+  DisplayError serr = disp->GetSupportedDSIClock(&rates);
+  uint64_t target = 1056000000ULL;  // Ace 3 AA551 rates[1]
+  if (serr == kErrorNone && rates.size() > 1) {
+    target = rates[1];
+  } else if (serr == kErrorNone && !rates.empty()) {
+    target = rates.back();
+  }
+
+  DisplayError err = disp->SetDynamicDSIClock(target);
+  DLOGI("Pxlw Iris7: SetIrisDynamicDsiClk enable=1 target=%" PRIu64 " err=%d (rates=%zu)",
+        target, err, rates.size());
+  // Dyn bit-clk latches on next commit; kick a frame so cached_clk_rate updates.
+  callbacks_.Refresh(HWC_DISPLAY_PRIMARY);
+  // Service only sends enable=1 after BypassToPt timeout — re-arm another PT attempt.
+  disp->IrisNotifyDsiClkEnabled();
+  return (err == kErrorNone || err == kErrorNotSupported);
+}
+#endif
+#endif
+
 android::status_t HWCSession::GetDsiClk(const android::Parcel *input_parcel,
                                         android::Parcel *output_parcel) {
   int disp_id = input_parcel->readInt32();
@@ -2906,25 +2974,42 @@ int HWCSession::CreatePrimaryDisplay() {
 
 #ifdef PXLW_IRIS
 #ifdef SUPPORTS_PXLW_IRIS7
-        // HW iris7 devices ship the iris service and rc declaration,
-        // so just initialize the wrapper for the primary panel during bring-up.
-        auto *iris_wrapper = pxlw::PxlwIrisWrapper::GetInstance();
-        if (iris_wrapper) {
+        // HW iris7/7P: init service, register HWC callbacks, push active config.
+        // (MEMC Phase 2 — leave SLEEP-ABYPASS requires power/present path too.)
+        if (auto *iris_base = pxlw::PxlwIrisWrapper::GetInstance()) {
           DisplayConfigVariableInfo config = {};
           hwc_display[0]->GetDisplayAttributesForConfig(0, &config);
-          reinterpret_cast<pxlw::PxlwIris7Wrapper *>(iris_wrapper)
-              ->InitPrimaryDisplay(config.vsync_period_ns, config.x_pixels, config.y_pixels);
+
+          // Stock registers these so the Iris service can request refresh / clk / osc.
+          // SetDsiClkCB is required for ABYP→PT: kernel rejects PT when cached_clk_rate==0.
+          iris_base->SetRefreshCB(
+              [](void *cookie) {
+                if (auto *session = reinterpret_cast<HWCSession *>(cookie)) {
+                  session->Refresh(HWC_DISPLAY_PRIMARY);
+                }
+              },
+              this);
+          iris_base->SetDsiClkCB(&HWCSession::IrisSetDsiClk, this);
+          iris_base->SetPanelOscStateCB(
+              [](void * /*cookie*/, bool /*enable*/) -> bool { return true; }, this);
+          iris_base->SetApColorModeCB([](void * /*cookie*/, bool /*enable*/) {}, this);
+
+          if (auto *iris7 = pxlw::AsIris7Wrapper(iris_base)) {
+            iris7->InitPrimaryDisplay(config.vsync_period_ns, config.x_pixels, config.y_pixels);
+            iris7->SetActiveConfig(0, 0, &config);
+            DLOGI("Pxlw Iris7: InitPrimaryDisplay %ux%u @ %dns + callbacks + SetActiveConfig",
+                  config.x_pixels, config.y_pixels, config.vsync_period_ns);
+          }
         }
 #else
-        // This indirectly invokes IrisService constructor as required in devices
-        // with soft-iris that don't ship with iris-service binary.
+        // Soft-iris devices: construct path via InitPrimaryDisplay when hasSoftIris.
         auto *iris_wrapper = pxlw::PxlwIrisWrapper::GetInstance();
         auto iris_feature = pxlw::IrisFeature::getInstance();
         DisplayConfigVariableInfo config = {};
         hwc_display[0]->GetDisplayAttributesForConfig(0, &config);
 
         if (iris_wrapper && iris_feature->hasSoftIris()) {
-          reinterpret_cast<pxlw::PxlwSoftirisWrapper *>(iris_wrapper)
+          pxlw::AsSoftirisWrapper(iris_wrapper)
               ->InitPrimaryDisplay(config.vsync_period_ns, config.x_pixels, config.y_pixels);
         }
 #endif

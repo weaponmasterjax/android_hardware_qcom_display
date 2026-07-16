@@ -1,6 +1,8 @@
 /*
  * SPDX-FileCopyrightText: 2025 The LineageOS Project
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Declarations for symbols exported by vendor libpwirisfeature.so.
  */
 
 #pragma once
@@ -22,6 +24,8 @@ class IrisFeature {
   bool hasIris();
   bool hasIris5();
   bool hasIris7();
+  // Ace 3 / Iris 7P — required for correct service selection (type 0x207).
+  bool hasIris7p();
 
  private:
   IrisFeature() = default;
