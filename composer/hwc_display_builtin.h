@@ -242,6 +242,7 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   // Auto video MEMC (stock Iris7 MemcEn subset). Needs layer identity path + PT.
   // persist.vendor.display.iris.auto_memc=0 disables. Video only — not games.
   bool iris_memc_on_ = false;
+  bool iris_memc_off_pending_ = false;  // a kill/timing OFF was rejected; keep retrying
   uint32_t iris_memc_video_frames_ = 0;
   uint32_t iris_memc_novideo_frames_ = 0;
   int iris_memc_last_config_ = -1;  // teardown/re-enter across timing switches
