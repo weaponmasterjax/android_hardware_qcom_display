@@ -676,6 +676,22 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     return;
   }
 
+  // Timing switches race the PT2MEMC arm: a 120→60 switch while the service is
+  // armed but FRC not engaged can stall the encoder TE (wr_ptr/kickoff timeouts →
+  // HwRecovery reset storm = visible flicker). Stock settles/pins the refresh rate
+  // BEFORE sending 258 — mirror that: tear down on a pending/applied config change
+  // and only (re)enter after a full stable window.
+  const int active_config = GetActiveConfigIndex();
+  const bool timing_changing = pending_config_ || (active_config != iris_memc_last_config_);
+  iris_memc_last_config_ = active_config;
+  if (timing_changing) {
+    iris_memc_video_frames_ = 0;
+    iris_memc_novideo_frames_ = 0;
+    if (!iris_memc_on_) {
+      return;
+    }
+  }
+
   const bool video = !kill && IrisVideoMemcEligible();
   if (video) {
     iris_memc_video_frames_++;
@@ -688,7 +704,8 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   const bool want_on = video && !iris_memc_on_ &&
                        iris_memc_video_frames_ >= kIrisMemcEnterFrames;
   const bool want_off = iris_memc_on_ &&
-                        (kill || (!video && iris_memc_novideo_frames_ >= kIrisMemcExitFrames));
+                        (kill || timing_changing ||
+                         (!video && iris_memc_novideo_frames_ >= kIrisMemcExitFrames));
   if (!want_on && !want_off) {
     return;
   }
@@ -730,7 +747,8 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
         "video_frames=%u%s",
         want_on ? "ON" : "OFF", vals[0], status,
         want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
-        (want_off && kill) ? " (kill-switch)" : "");
+        (want_off && kill) ? " (kill-switch)"
+                           : (want_off && timing_changing) ? " (timing change)" : "");
 }
 #endif
 #endif
