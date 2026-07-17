@@ -452,6 +452,7 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
   if (mode != HWC2::PowerMode::On) {
     iris_memc_on_ = false;
     iris_memc_off_pending_ = false;
+    iris_memc_off_time_ns_ = 0;
     iris_memc_video_frames_ = 0;
     iris_memc_novideo_frames_ = 0;
   }
@@ -677,13 +678,15 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     return;
   }
 
-  // Timing switches race the PT2MEMC arm: a 120→60 switch while the service is
-  // armed but FRC not engaged can stall the encoder TE (wr_ptr/kickoff timeouts →
-  // HwRecovery reset storm = visible flicker). Stock settles/pins the refresh rate
-  // BEFORE sending 258 — mirror that: tear down on a pending/applied config change
-  // and only (re)enter after a full stable window.
+  // Timing switches race the PT2MEMC arm: a 120→60 switch while FRC is live stalls
+  // the encoder TE (wr_ptr/kickoff → HwRecovery). SubmitDisplayConfig is held while
+  // MEMC is on (CanApplyPendingConfig); that leaves pending_refresh_rate_config_
+  // set WITHOUT changing the active config — so we must treat a pending RR request
+  // as timing_changing here or OFF never fires and the hold deadlocks.
   const int active_config = GetActiveConfigIndex();
-  const bool timing_changing = pending_config_ || (active_config != iris_memc_last_config_);
+  const bool rr_pending = (pending_refresh_rate_config_ != UINT_MAX);
+  const bool timing_changing = pending_config_ || rr_pending ||
+                               (active_config != iris_memc_last_config_);
   iris_memc_last_config_ = active_config;
   if (timing_changing) {
     iris_memc_video_frames_ = 0;
@@ -762,21 +765,27 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
         want_on ? "ON" : "OFF", vals[0], status,
         want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
         (want_off && kill) ? " (kill-switch)"
+                           : (want_off && rr_pending) ? " (pending rr)"
                            : (want_off && timing_changing) ? " (timing change)"
                            : (want_off && off_retry_due) ? " (off retry)" : "");
 }
 
 bool HWCDisplayBuiltIn::CanApplyPendingConfig() {
-  // Hold SF's mode switch while a MEMC session is live or unwinding — the OFF is
-  // sent by MaybeRequestIrisVideoMemc on the still-pending config, and the chip
-  // needs the FRC2PT sequence to finish before the DSI timing switch goes down.
+  // Hold SF mode switches (UpdateActiveConfig AND SubmitDisplayConfig) while a MEMC
+  // session is live or unwinding. OFF is sent by MaybeRequestIrisVideoMemc when it
+  // sees pending_refresh_rate_config_ / pending_config_; the chip needs FRC2PT to
+  // finish before the DSI timing switch goes down.
   if (iris_memc_on_) {
-    callbacks_->Refresh(id_);  // keep frames flowing so the OFF/unwind can progress
+    if (callbacks_) {
+      callbacks_->Refresh(id_);  // keep frames flowing so the OFF/unwind can progress
+    }
     return false;
   }
   if (iris_memc_off_time_ns_ &&
       (systemTime(SYSTEM_TIME_MONOTONIC) - iris_memc_off_time_ns_) < kIrisMemcUnwindNs) {
-    callbacks_->Refresh(id_);
+    if (callbacks_) {
+      callbacks_->Refresh(id_);
+    }
     return false;
   }
   return true;

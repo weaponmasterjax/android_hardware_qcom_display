@@ -2524,6 +2524,19 @@ int HWCDisplay::SetActiveDisplayConfig(uint32_t config) {
     return 0;
   }
 
+  // Same MEMC/FRC hold as SubmitDisplayConfig / UpdateActiveConfig.
+  if (!CanApplyPendingConfig()) {
+    DLOGI("Pxlw Iris7: hold SetActiveDisplayConfig %u→%u until MEMC unwinds",
+          current_config, config);
+    // Route through the deferred pending_config_ path so Present can OFF then apply.
+    pending_config_ = true;
+    pending_config_index_ = config;
+    if (callbacks_) {
+      callbacks_->Refresh(id_);
+    }
+    return 0;
+  }
+
   DisplayError error = display_intf_->SetActiveConfig(config);
   if (error != kErrorNone) {
     DLOGE("Failed to set %d config! Error: %d", config, error);
@@ -3073,6 +3086,17 @@ HWC2::Error HWCDisplay::SubmitDisplayConfig(hwc2_config_t config) {
   hwc2_config_t current_config = 0;
   GetActiveConfig(&current_config);
 
+  // SF VRR path (SetActiveConfigWithConstraints → ProcessActiveConfigChange) applies
+  // timing HERE, not via pending_config_/UpdateActiveConfig. Holding only the latter
+  // left 120→60 switches under live Iris FRC (MEMC_CTRL_SWITCH_TIMEOUT → HwRecovery).
+  // Return BadConfig without clearing pending_refresh_rate_* so SubmitActiveConfigChange
+  // leaves the request armed and retries next vsync after MEMC unwinds.
+  if (!CanApplyPendingConfig()) {
+    DLOGI("Pxlw Iris7: hold SubmitDisplayConfig %d→%d until MEMC unwinds",
+          INT(current_config), INT(config));
+    return HWC2::Error::BadConfig;
+  }
+
   DisplayError error = display_intf_->SetActiveConfig(config);
   if (error == kErrorDeferred) {
     DLOGW("Failed to set new config:%d from current config:%d! Error: %d",
@@ -3101,6 +3125,15 @@ HWC2::Error HWCDisplay::SubmitDisplayConfig(hwc2_config_t config) {
       return HWC2::Error::BadParameter;
     }
   }
+
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Match UpdateActiveConfig: push applied timing to Iris on the seamless path too.
+  if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+    iris7->SetActiveConfig(0, 0, static_cast<unsigned int>(config), &info);
+  }
+#endif
+#endif
 
   return HWC2::Error::None;
 }
