@@ -2744,6 +2744,12 @@ bool HWCSession::SetIrisDynamicDsiClk(bool enable) {
   //   3) timeout, then SetDsiClkCB(enable=1) → 1056000000 (too late)
   // enable=0 must not force default bit-clk before the PT ioctl.
   // enable=1 arms rates[1]; enable=0 is a no-op (keep post-On PT rate).
+  //
+  // LOCK INVARIANT: this runs on an Iris service thread and takes the primary
+  // display lock below. It must never be reached synchronously from a wrapper/HIDL
+  // call issued while Present holds that lock (in-process irisConfigureSet) —
+  // today that is safe only because enable=0 returns before locking and the
+  // service sends enable=1 asynchronously after a BypassToPt timeout.
   if (!enable) {
     DLOGI("Pxlw Iris7: SetIrisDynamicDsiClk enable=0 — no-op (keep PT bit-clk)");
     return true;
