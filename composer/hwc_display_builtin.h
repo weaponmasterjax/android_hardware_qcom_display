@@ -244,7 +244,11 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   bool iris_memc_on_ = false;
   uint32_t iris_memc_video_frames_ = 0;
   uint32_t iris_memc_novideo_frames_ = 0;
-  static constexpr uint32_t kIrisMemcEnterFrames = 8;
+  int iris_memc_last_config_ = -1;  // teardown/re-enter across timing switches
+  // Enter after ~200ms@120 / 400ms@60 of stable video+timing: SF's fullscreen-video
+  // 120→60 vote must land BEFORE we arm 258 (stock delays 400-600ms for the same
+  // reason). Racing the switch while armed stalls the encoder → HwRecovery flicker.
+  static constexpr uint32_t kIrisMemcEnterFrames = 24;
   static constexpr uint32_t kIrisMemcExitFrames = 16;
   // Single video layer must cover this much of the framebuffer (excludes camera
   // preview 4:3 ≈ 0.61, PiP, feed thumbnails; passes 16:9 landscape ≈ 0.81).
