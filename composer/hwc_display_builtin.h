@@ -193,6 +193,7 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   void MaybeRequestIrisPt();
   void MaybeRequestIrisVideoMemc();
   bool IrisVideoMemcEligible();
+  bool CanApplyPendingConfig() override;
   void IrisNotifyDsiClkEnabled() override;
 #endif
 #endif
@@ -246,6 +247,12 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   uint32_t iris_memc_video_frames_ = 0;
   uint32_t iris_memc_novideo_frames_ = 0;
   int iris_memc_last_config_ = -1;  // teardown/re-enter across timing switches
+  nsecs_t iris_memc_off_time_ns_ = 0;  // last accepted 258-0, for the unwind hold
+  // A timing switch reaching the panel while FRC is live times out the chip's own
+  // switch machine (MEMC_CTRL_SWITCH_TIMEOUT → wr_ptr/kickoff death → HwRecovery
+  // blanking). CanApplyPendingConfig holds the config until the OFF is accepted
+  // plus this grace for the async VFR_DISABLE→PT_PREPARE→FRC2PT (~35ms observed).
+  static constexpr nsecs_t kIrisMemcUnwindNs = 80000000;  // 80ms
   // Enter after ~200ms@120 / 400ms@60 of stable video+timing: SF's fullscreen-video
   // 120→60 vote must land BEFORE we arm 258 (stock delays 400-600ms for the same
   // reason). Racing the switch while armed stalls the encoder → HwRecovery flicker.

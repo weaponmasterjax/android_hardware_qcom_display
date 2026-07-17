@@ -754,6 +754,9 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   }
   iris_memc_on_ = want_on;
   iris_memc_off_pending_ = false;
+  if (want_off) {
+    iris_memc_off_time_ns_ = systemTime(SYSTEM_TIME_MONOTONIC);
+  }
   DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0) status=%d "
         "video_frames=%u%s",
         want_on ? "ON" : "OFF", vals[0], status,
@@ -761,6 +764,22 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
         (want_off && kill) ? " (kill-switch)"
                            : (want_off && timing_changing) ? " (timing change)"
                            : (want_off && off_retry_due) ? " (off retry)" : "");
+}
+
+bool HWCDisplayBuiltIn::CanApplyPendingConfig() {
+  // Hold SF's mode switch while a MEMC session is live or unwinding — the OFF is
+  // sent by MaybeRequestIrisVideoMemc on the still-pending config, and the chip
+  // needs the FRC2PT sequence to finish before the DSI timing switch goes down.
+  if (iris_memc_on_) {
+    callbacks_->Refresh(id_);  // keep frames flowing so the OFF/unwind can progress
+    return false;
+  }
+  if (iris_memc_off_time_ns_ &&
+      (systemTime(SYSTEM_TIME_MONOTONIC) - iris_memc_off_time_ns_) < kIrisMemcUnwindNs) {
+    callbacks_->Refresh(id_);
+    return false;
+  }
+  return true;
 }
 #endif
 #endif

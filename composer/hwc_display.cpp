@@ -2913,6 +2913,11 @@ void HWCDisplay::UpdateActiveConfig() {
     return;
   }
 
+  // Stays pending and is retried next cycle (stock: IsContextReadyToSubmitActiveConfig).
+  if (!CanApplyPendingConfig()) {
+    return;
+  }
+
   int active_config = GetActiveConfigIndex();
   if (IsVirtualConfig(pending_config_index_) ||
       (active_config >= 0 && IsVirtualConfig(UINT32(active_config)))) {
