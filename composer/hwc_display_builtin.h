@@ -192,6 +192,7 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
 #ifdef SUPPORTS_PXLW_IRIS7
   void MaybeRequestIrisPt();
   void MaybeRequestIrisVideoMemc();
+  bool IrisVideoMemcEligible();
   void IrisNotifyDsiClkEnabled() override;
 #endif
 #endif
@@ -228,6 +229,7 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   // kernel cached_clk_rate can still be 0 — bounce default→PT rate before ioctl.
   bool iris_pending_pt_ = false;
   bool iris_pt_requested_ = false;
+  bool iris_pt_confirmed_ = false;  // configureSet(56) accepted — chip left ABYP
   uint32_t iris_pt_present_count_ = 0;
   uint32_t iris_pt_phase_ = 0;       // 0 bounce-low, 1 arm-high, 2 wait-latch, 3 fire
   uint32_t iris_pt_phase_frame_ = 0;
@@ -244,6 +246,9 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   uint32_t iris_memc_novideo_frames_ = 0;
   static constexpr uint32_t kIrisMemcEnterFrames = 8;
   static constexpr uint32_t kIrisMemcExitFrames = 16;
+  // Single video layer must cover this much of the framebuffer (excludes camera
+  // preview 4:3 ≈ 0.61, PiP, feed thumbnails; passes 16:9 landscape ≈ 0.81).
+  static constexpr float kIrisMemcMinVideoCoverage = 0.7f;
 #endif
 #endif
   // Members for Color sampling feature

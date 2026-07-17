@@ -424,17 +424,16 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
   // Dyn clock latches on subsequent commit (Present path).
   if (mode == HWC2::PowerMode::On) {
     std::vector<uint64_t> rates;
-    uint64_t target = 1056000000ULL;
-    if (GetSupportedDSIClock(&rates) == kErrorNone && rates.size() > 1) {
-      target = rates[1];
-    } else if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
-      target = rates.back();
+    uint64_t target = kIrisPtBitClkHz;
+    if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+      target = rates.size() > 1 ? rates[1] : rates.back();
     }
     DisplayError cerr = SetDynamicDSIClock(target);
     DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
     // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
     iris_pending_pt_ = true;
     iris_pt_requested_ = false;
+    iris_pt_confirmed_ = false;
     iris_pt_present_count_ = 0;
     iris_pt_phase_ = 0;
     iris_pt_phase_frame_ = 0;
@@ -442,9 +441,18 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
   } else if (mode == HWC2::PowerMode::Off || mode == HWC2::PowerMode::DozeSuspend) {
     iris_pending_pt_ = false;
     iris_pt_requested_ = false;
+    iris_pt_confirmed_ = false;
     iris_pt_present_count_ = 0;
     iris_pt_phase_ = 0;
     iris_pt_attempts_ = 0;
+  }
+  // Any transition away from On knocks the chip out of FRC (service resets on the
+  // power change) — drop MEMC bookkeeping so the next video session re-enters
+  // instead of trusting a stale ON flag.
+  if (mode != HWC2::PowerMode::On) {
+    iris_memc_on_ = false;
+    iris_memc_video_frames_ = 0;
+    iris_memc_novideo_frames_ = 0;
   }
 #endif
 #endif
@@ -520,12 +528,25 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
 
 #ifdef PXLW_IRIS
 #ifdef SUPPORTS_PXLW_IRIS7
+namespace {
+// IIris is registered in-process by libpwirisservicei7p — cache after first hit.
+// Only called on the Present path under the display lock, so no extra locking.
+android::sp<IIris> GetIrisHal() {
+  static android::sp<IIris> iris = nullptr;
+  if (iris == nullptr) {
+    iris = IIris::getService();
+  }
+  return iris;
+}
+}  // namespace
+
 void HWCDisplayBuiltIn::IrisNotifyDsiClkEnabled() {
   // Service enable=1 runs only after BypassToPt timeout — schedule another PT try
   // now that it is pushing the high bit-clk path.
   DLOGI("Pxlw Iris7: IrisNotifyDsiClkEnabled — re-arm auto-PT after service enable=1");
   iris_pending_pt_ = true;
   iris_pt_requested_ = false;
+  iris_pt_confirmed_ = false;  // service is retrying PT — chip is not in PT
   iris_pt_present_count_ = 0;
   iris_pt_phase_ = 2;  // high rate is being set by SetIrisDynamicDsiClk; wait latch
   iris_pt_phase_frame_ = 0;
@@ -546,10 +567,15 @@ void HWCDisplayBuiltIn::MaybeRequestIrisPt() {
   // Phase 0: force default rate so SDM cannot short-circuit the next high-rate set
   // (userspace may already think clk==1056 while kernel cached_clk_rate is still 0).
   if (iris_pt_phase_ == 0) {
-    SetDynamicDSIClock(kIrisDefaultBitClkHz);
+    std::vector<uint64_t> rates;
+    uint64_t bounce = kIrisDefaultBitClkHz;
+    if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+      bounce = rates[0];
+    }
+    SetDynamicDSIClock(bounce);
     iris_pt_phase_ = 1;
     iris_pt_phase_frame_ = iris_pt_present_count_;
-    DLOGI("Pxlw Iris7: auto-PT phase0 bounce to default bit-clk");
+    DLOGI("Pxlw Iris7: auto-PT phase0 bounce to default bit-clk %" PRIu64, bounce);
     return;
   }
 
@@ -558,10 +584,15 @@ void HWCDisplayBuiltIn::MaybeRequestIrisPt() {
     if (iris_pt_present_count_ - iris_pt_phase_frame_ < 2) {
       return;
     }
-    SetDynamicDSIClock(kIrisPtBitClkHz);
+    std::vector<uint64_t> rates;
+    uint64_t target = kIrisPtBitClkHz;
+    if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+      target = rates.size() > 1 ? rates[1] : rates.back();
+    }
+    SetDynamicDSIClock(target);
     iris_pt_phase_ = 2;
     iris_pt_phase_frame_ = iris_pt_present_count_;
-    DLOGI("Pxlw Iris7: auto-PT phase1 arm PT bit-clk %" PRIu64, kIrisPtBitClkHz);
+    DLOGI("Pxlw Iris7: auto-PT phase1 arm PT bit-clk %" PRIu64, target);
     return;
   }
 
@@ -574,7 +605,7 @@ void HWCDisplayBuiltIn::MaybeRequestIrisPt() {
   }
 
   // Phase 3: irisConfigureSet(56, 0) → BypassToPt
-  auto iris = IIris::getService();
+  auto iris = GetIrisHal();
   if (iris == nullptr) {
     DLOGW("Pxlw Iris7: auto-PT IIris getService failed (retry)");
     iris_pt_phase_ = 0;  // restart bounce
@@ -594,26 +625,58 @@ void HWCDisplayBuiltIn::MaybeRequestIrisPt() {
           ret.description().c_str());
     return;
   }
+  // status 0 = BypassToPt accepted; a later service timeout re-arms via
+  // IrisNotifyDsiClkEnabled and clears confirmed again.
+  iris_pt_confirmed_ = (int32_t(ret) == 0);
   DLOGI("Pxlw Iris7: auto-PT irisConfigureSet(56, 0) status=%d attempt=%u after %u presents",
         int32_t(ret), iris_pt_attempts_, iris_pt_present_count_);
+}
+
+bool HWCDisplayBuiltIn::IrisVideoMemcEligible() {
+  // FRC only a real video session: exactly one video-type layer covering most of
+  // the framebuffer. Camera preview, PiP and feed thumbnails are BUFFER_TYPE_VIDEO
+  // too and must not enter MEMC (artifacts / latency / power).
+  if (!layer_stack_.flags.video_present) {
+    return false;
+  }
+  uint32_t fb_width = 0, fb_height = 0;
+  GetFrameBufferResolution(&fb_width, &fb_height);
+  const float display_area = static_cast<float>(fb_width) * static_cast<float>(fb_height);
+  if (display_area <= 0.0f) {
+    return false;
+  }
+  uint32_t video_layers = 0;
+  float video_area = 0.0f;
+  for (auto *layer : layer_stack_.layers) {
+    if (!layer || !layer->input_buffer.flags.video) {
+      continue;
+    }
+    video_layers++;
+    const LayerRect &dst = layer->dst_rect;
+    video_area = (dst.right - dst.left) * (dst.bottom - dst.top);
+  }
+  return video_layers == 1 && video_area >= kIrisMemcMinVideoCoverage * display_area;
 }
 
 void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   // Stock HWC owns MemcEn; type 258 alone without layers freezes. Layer identity is
   // wired; this is the minimal video enter/exit (SET_HDR_FORMAL / formal MEMC=10).
-  // Kill-switch: setprop persist.vendor.display.iris.auto_memc 0
+  // Kill-switch: setprop persist.vendor.display.iris.auto_memc 0 — must still be
+  // able to exit an active MEMC session, so only bail early when already off.
   char prop[PROPERTY_VALUE_MAX] = {};
   property_get("persist.vendor.display.iris.auto_memc", prop, "1");
-  if (prop[0] == '0') {
+  const bool kill = (prop[0] == '0');
+  if (kill && !iris_memc_on_) {
     return;
   }
 
-  // Do not fight the ABYP→PT state machine. Once PT is stable (or already on), proceed.
-  if (iris_pending_pt_) {
+  // Only touch MEMC once ABYP→PT completed (56 accepted) and no PT attempt is in
+  // flight — after a PT give-up the chip is still in ABYP; 258 there is invalid.
+  if (iris_pending_pt_ || !iris_pt_confirmed_) {
     return;
   }
 
-  const bool video = layer_stack_.flags.video_present;
+  const bool video = !kill && IrisVideoMemcEligible();
   if (video) {
     iris_memc_video_frames_++;
     iris_memc_novideo_frames_ = 0;
@@ -622,24 +685,23 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     iris_memc_video_frames_ = 0;
   }
 
-  const bool want_on = video && iris_memc_video_frames_ >= kIrisMemcEnterFrames;
-  const bool want_off = !video && iris_memc_on_ &&
-                        iris_memc_novideo_frames_ >= kIrisMemcExitFrames;
+  const bool want_on = video && !iris_memc_on_ &&
+                       iris_memc_video_frames_ >= kIrisMemcEnterFrames;
+  const bool want_off = iris_memc_on_ &&
+                        (kill || (!video && iris_memc_novideo_frames_ >= kIrisMemcExitFrames));
   if (!want_on && !want_off) {
     return;
   }
-  if (want_on && iris_memc_on_) {
-    return;
-  }
 
-  auto iris = IIris::getService();
+  auto iris = GetIrisHal();
   if (iris == nullptr) {
     DLOGW("Pxlw Iris7: auto-MEMC IIris getService failed");
     return;
   }
 
   // irisConfig 258 4 <formal> -1 <scene> -1
-  // formal: HDR_FORMAL_MEMC=10, off=0; scene: video=0 (not game=2).
+  // formal: HDR_FORMAL_MEMC=10, off=0; scene 0 = video. (Stock game profiles are
+  // per-title IMV commands 258-10-99-50-99-<sceneId>-<fps> — see memc.md §11.2.)
   android::hardware::hidl_vec<int32_t> vals;
   vals.resize(4);
   vals[0] = want_on ? 10 : 0;
@@ -647,16 +709,28 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   vals[2] = 0;
   vals[3] = -1;
   auto ret = iris->irisConfigureSet(258 /* SET_HDR_FORMAL */, vals);
-  if (!ret.isOk()) {
-    DLOGE("Pxlw Iris7: auto-MEMC irisConfigureSet transport failed: %s",
-          ret.description().c_str());
+  const int32_t status = ret.isOk() ? int32_t(ret) : INT32_MIN;
+  if (status != 0) {
+    if (!ret.isOk()) {
+      DLOGE("Pxlw Iris7: auto-MEMC irisConfigureSet transport failed: %s",
+            ret.description().c_str());
+    } else {
+      DLOGW("Pxlw Iris7: auto-MEMC %s rejected status=%d — will retry after a full "
+            "enter/exit window",
+            want_on ? "ON" : "OFF", status);
+    }
+    // Do NOT latch iris_memc_on_ on failure; zero the counters so the retry needs
+    // another full hysteresis window instead of hammering every frame.
+    iris_memc_video_frames_ = 0;
+    iris_memc_novideo_frames_ = 0;
     return;
   }
   iris_memc_on_ = want_on;
   DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0) status=%d "
-        "video_frames=%u",
-        want_on ? "ON" : "OFF", vals[0], int32_t(ret),
-        want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_);
+        "video_frames=%u%s",
+        want_on ? "ON" : "OFF", vals[0], status,
+        want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
+        (want_off && kill) ? " (kill-switch)" : "");
 }
 #endif
 #endif
