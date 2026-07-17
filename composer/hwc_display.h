@@ -551,6 +551,7 @@ class HWCDisplay : public DisplayEventHandler {
   void MMRMEvent(bool restricted);
   void UpdateRefreshRate();
   void UpdateActiveConfig();
+  virtual bool CanApplyPendingConfig() { return true; }
   void DumpInputBuffers(void);
   void RetrieveFences(shared_ptr<Fence> *out_retire_fence);
   void SetDrawMethod();

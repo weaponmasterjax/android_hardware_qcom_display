@@ -2804,6 +2804,11 @@ void HWCDisplay::UpdateActiveConfig() {
     return;
   }
 
+  // Stays pending and is retried next cycle (stock: IsContextReadyToSubmitActiveConfig).
+  if (!CanApplyPendingConfig()) {
+    return;
+  }
+
   DisplayError error = display_intf_->SetActiveConfig(pending_config_index_);
   if (error != kErrorNone) {
     DLOGI("Failed to set %d config", INT(pending_config_index_));
