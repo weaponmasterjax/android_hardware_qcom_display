@@ -451,6 +451,7 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
   // instead of trusting a stale ON flag.
   if (mode != HWC2::PowerMode::On) {
     iris_memc_on_ = false;
+    iris_memc_off_pending_ = false;
     iris_memc_video_frames_ = 0;
     iris_memc_novideo_frames_ = 0;
   }
@@ -703,8 +704,14 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
 
   const bool want_on = video && !iris_memc_on_ &&
                        iris_memc_video_frames_ >= kIrisMemcEnterFrames;
+  // A rejected kill/timing OFF must keep retrying even though timing_changing is a
+  // one-Present edge — otherwise a still-eligible video pins the stale ON until the
+  // video ends. Counters were zeroed on the failure, so this is a ~16-present backoff.
+  const bool off_retry_due = iris_memc_off_pending_ &&
+                             (iris_memc_video_frames_ >= kIrisMemcExitFrames ||
+                              iris_memc_novideo_frames_ >= kIrisMemcExitFrames);
   const bool want_off = iris_memc_on_ &&
-                        (kill || timing_changing ||
+                        (kill || timing_changing || off_retry_due ||
                          (!video && iris_memc_novideo_frames_ >= kIrisMemcExitFrames));
   if (!want_on && !want_off) {
     return;
@@ -738,17 +745,22 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     }
     // Do NOT latch iris_memc_on_ on failure; zero the counters so the retry needs
     // another full hysteresis window instead of hammering every frame.
+    if (want_off) {
+      iris_memc_off_pending_ = true;
+    }
     iris_memc_video_frames_ = 0;
     iris_memc_novideo_frames_ = 0;
     return;
   }
   iris_memc_on_ = want_on;
+  iris_memc_off_pending_ = false;
   DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0) status=%d "
         "video_frames=%u%s",
         want_on ? "ON" : "OFF", vals[0], status,
         want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
         (want_off && kill) ? " (kill-switch)"
-                           : (want_off && timing_changing) ? " (timing change)" : "");
+                           : (want_off && timing_changing) ? " (timing change)"
+                           : (want_off && off_retry_due) ? " (off retry)" : "");
 }
 #endif
 #endif
