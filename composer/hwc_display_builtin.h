@@ -191,6 +191,10 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
 #ifdef PXLW_IRIS
 #ifdef SUPPORTS_PXLW_IRIS7
   void MaybeRequestIrisPt();
+  // Explicit request engine (sys.display.iris.memc_request). Returns true when
+  // it owns the MEMC path this Present (active request or request-driven teardown),
+  // so auto-video must not run.
+  bool MaybeRequestIrisExplicitMemc();
   void MaybeRequestIrisVideoMemc();
   bool IrisVideoMemcEligible();
   bool CanApplyPendingConfig() override;
@@ -240,14 +244,22 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   static constexpr uint64_t kIrisPtBitClkHz = 1056000000ULL;
   static constexpr uint64_t kIrisDefaultBitClkHz = 1113600000ULL;
 
-  // Auto video MEMC (stock Iris7 MemcEn subset). Needs layer identity path + PT.
-  // persist.vendor.display.iris.auto_memc=0 disables. Video only — not games.
+  // MEMC session state (shared by auto-video and the explicit request engine).
+  // Needs layer identity path + PT. Auto-video kill-switch:
+  // persist.vendor.display.iris.auto_memc=0. Explicit requests use
+  // sys.display.iris.memc_request and are not gated by auto_memc.
   bool iris_memc_on_ = false;
   bool iris_memc_off_pending_ = false;  // a kill/timing OFF was rejected; keep retrying
+  bool iris_memc_request_driven_ = false;  // session (or pending OFF) owned by request prop
   uint32_t iris_memc_video_frames_ = 0;
   uint32_t iris_memc_novideo_frames_ = 0;
+  uint32_t iris_memc_request_backoff_ = 0;  // presents to wait after a rejected request 258
   int iris_memc_last_config_ = -1;  // teardown/re-enter across timing switches
   nsecs_t iris_memc_off_time_ns_ = 0;  // last accepted 258-0, for the unwind hold
+  // Last accepted request payload (for dedup / reconfigure). nvals==0 → none applied.
+  static constexpr int kIrisMemcRequestMaxVals = 8;
+  int32_t iris_memc_request_vals_[kIrisMemcRequestMaxVals] = {};
+  int iris_memc_request_nvals_ = 0;
   // A timing switch reaching the panel while FRC is live times out the chip's own
   // switch machine (MEMC_CTRL_SWITCH_TIMEOUT → wr_ptr/kickoff death → HwRecovery
   // blanking). CanApplyPendingConfig holds UpdateActiveConfig AND SubmitDisplayConfig
