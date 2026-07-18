@@ -42,8 +42,12 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
+#include <strings.h>
 #include <vector>
 
 #include "hwc_display_builtin.h"
@@ -447,14 +451,18 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
     iris_pt_attempts_ = 0;
   }
   // Any transition away from On knocks the chip out of FRC (service resets on the
-  // power change) — drop MEMC bookkeeping so the next video session re-enters
-  // instead of trusting a stale ON flag.
+  // power change) — drop MEMC bookkeeping so the next video/request session re-enters
+  // instead of trusting a stale ON flag. The request prop is left for userspace;
+  // on the next On+PT we re-apply it.
   if (mode != HWC2::PowerMode::On) {
     iris_memc_on_ = false;
     iris_memc_off_pending_ = false;
+    iris_memc_request_driven_ = false;
     iris_memc_off_time_ns_ = 0;
     iris_memc_video_frames_ = 0;
     iris_memc_novideo_frames_ = 0;
+    iris_memc_request_backoff_ = 0;
+    iris_memc_request_nvals_ = 0;
   }
 #endif
 #endif
@@ -514,7 +522,11 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
           iris7->PresentDisplay(static_cast<unsigned long>(id_));
         }
         MaybeRequestIrisPt();
-        MaybeRequestIrisVideoMemc();
+        // Explicit request engine owns game/policy MEMC; suppresses auto-video
+        // while a request is active or a request-driven OFF is still in flight.
+        if (!MaybeRequestIrisExplicitMemc()) {
+          MaybeRequestIrisVideoMemc();
+        }
       }
 #endif
 #endif
@@ -660,6 +672,222 @@ bool HWCDisplayBuiltIn::IrisVideoMemcEligible() {
   return video_layers == 1 && video_area >= kIrisMemcMinVideoCoverage * display_area;
 }
 
+namespace {
+// Parse sys.display.iris.memc_request into irisConfigureSet(258) payload.
+// Accepted: "" / "0" / "off" → off (return 0); "10,-1,50,-1,0,60" or space-separated.
+// Returns nvals (>=0) or -1 on malformed input. vals[0]==0 with nvals>0 is also off.
+int ParseIrisMemcRequest(const char *prop, int32_t *vals, int max_vals) {
+  if (!prop || !prop[0]) {
+    return 0;
+  }
+  // Trim leading spaces
+  while (*prop == ' ' || *prop == '\t') {
+    prop++;
+  }
+  if (!prop[0] || !strcasecmp(prop, "off") || !strcasecmp(prop, "0")) {
+    return 0;
+  }
+  int n = 0;
+  const char *p = prop;
+  while (*p && n < max_vals) {
+    while (*p == ' ' || *p == '\t' || *p == ',') {
+      p++;
+    }
+    if (!*p) {
+      break;
+    }
+    char *end = nullptr;
+    long v = strtol(p, &end, 10);
+    if (end == p) {
+      return -1;
+    }
+    vals[n++] = static_cast<int32_t>(v);
+    p = end;
+  }
+  // Trailing junk after a successful parse → reject
+  while (*p == ' ' || *p == '\t' || *p == ',') {
+    p++;
+  }
+  if (*p) {
+    return -1;
+  }
+  return n;
+}
+
+bool IrisMemcRequestValsEqual(const int32_t *a, int na, const int32_t *b, int nb) {
+  if (na != nb) {
+    return false;
+  }
+  for (int i = 0; i < na; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
+  // Policy/game path: userspace writes sys.display.iris.memc_request with the
+  // full 258 value list (e.g. PUBG IMV "10,-1,50,-1,0,60"). HWC fires
+  // irisConfigureSet at the Present boundary after layer identity + PT are ready —
+  // never a raw mid-game irisConfig (that freezes). Auto-video is suppressed while
+  // a request is active or a request-driven OFF is still pending.
+  char prop[PROPERTY_VALUE_MAX] = {};
+  property_get("sys.display.iris.memc_request", prop, "");
+
+  int32_t req_vals[kIrisMemcRequestMaxVals] = {};
+  int req_n = ParseIrisMemcRequest(prop, req_vals, kIrisMemcRequestMaxVals);
+  if (req_n < 0) {
+    DLOGW("Pxlw Iris7: memc_request malformed '%s' — ignoring", prop);
+    req_n = 0;
+  }
+  const bool want_on = (req_n > 0 && req_vals[0] != 0);
+
+  // Neither an active request nor a request-driven session → auto-video may run.
+  if (!want_on && !iris_memc_request_driven_) {
+    return false;
+  }
+
+  // Own the path from here (suppress auto-video) even if we cannot fire yet.
+  if (iris_pending_pt_ || !iris_pt_confirmed_) {
+    return true;
+  }
+
+  // Same timing-switch interlock as auto-video: never arm/reconfigure across a
+  // pending RR change; tear down first so CanApplyPendingConfig can release.
+  const int active_config = GetActiveConfigIndex();
+  const bool rr_pending = (pending_refresh_rate_config_ != UINT_MAX);
+  const bool timing_changing = pending_config_ || rr_pending ||
+                               (active_config != iris_memc_last_config_);
+  iris_memc_last_config_ = active_config;
+
+  if (iris_memc_request_backoff_ > 0) {
+    iris_memc_request_backoff_--;
+  }
+
+  // Desired action this Present.
+  bool do_off = false;
+  bool do_on = false;
+  const char *reason = "";
+
+  if (timing_changing) {
+    if (iris_memc_on_) {
+      do_off = true;
+      reason = rr_pending ? "pending rr" : "timing change";
+    } else {
+      // Wait for a stable window before (re)entering.
+      return true;
+    }
+  } else if (!want_on) {
+    // Request cleared — OFF if we still believe MEMC is on (or a prior OFF failed).
+    if (iris_memc_on_ || iris_memc_off_pending_) {
+      do_off = true;
+      reason = iris_memc_off_pending_ ? "off retry" : "request clear";
+    } else {
+      iris_memc_request_driven_ = false;
+      iris_memc_request_nvals_ = 0;
+      return false;  // fully idle → hand back to auto-video
+    }
+  } else if (!iris_memc_on_) {
+    // Enter (or retry after reject). No enter-frame hysteresis: policy is
+    // responsible for RR pin / fps cap before writing the prop (stock shape).
+    if (iris_memc_request_backoff_ == 0) {
+      do_on = true;
+      reason = "request";
+    }
+  } else if (!IrisMemcRequestValsEqual(req_vals, req_n,
+                                       iris_memc_request_vals_,
+                                       iris_memc_request_nvals_)) {
+    // Already on — reconfigure when payload changes (fps/profile swap).
+    if (iris_memc_request_backoff_ == 0) {
+      do_on = true;
+      reason = "reconfigure";
+    }
+  } else {
+    // Steady request-driven ON — nothing to do; keep suppressing auto-video.
+    iris_memc_request_driven_ = true;
+    return true;
+  }
+
+  if (!do_on && !do_off) {
+    return true;
+  }
+
+  auto iris = GetIrisHal();
+  if (iris == nullptr) {
+    DLOGW("Pxlw Iris7: memc_request IIris getService failed");
+    return true;
+  }
+
+  android::hardware::hidl_vec<int32_t> vals;
+  if (do_off) {
+    // Match auto-video OFF shape (formal=0).
+    vals.resize(4);
+    vals[0] = 0;
+    vals[1] = -1;
+    vals[2] = 0;
+    vals[3] = -1;
+  } else {
+    vals.resize(static_cast<size_t>(req_n));
+    for (int i = 0; i < req_n; i++) {
+      vals[i] = req_vals[i];
+    }
+  }
+
+  auto ret = iris->irisConfigureSet(258 /* SET_HDR_FORMAL */, vals);
+  const int32_t status = ret.isOk() ? int32_t(ret) : INT32_MIN;
+  if (status != 0) {
+    if (!ret.isOk()) {
+      DLOGE("Pxlw Iris7: memc_request irisConfigureSet transport failed: %s",
+            ret.description().c_str());
+    } else {
+      DLOGW("Pxlw Iris7: memc_request %s rejected status=%d — backoff %u presents",
+            do_on ? "ON" : "OFF", status, kIrisMemcExitFrames);
+    }
+    if (do_off) {
+      iris_memc_off_pending_ = true;
+      iris_memc_request_driven_ = true;
+    }
+    // Do not latch ON on failure; brief backoff so we don't hammer every frame.
+    iris_memc_request_backoff_ = kIrisMemcExitFrames;
+    return true;
+  }
+
+  if (do_on) {
+    iris_memc_on_ = true;
+    iris_memc_request_driven_ = true;
+    iris_memc_off_pending_ = false;
+    iris_memc_request_nvals_ = req_n;
+    for (int i = 0; i < req_n; i++) {
+      iris_memc_request_vals_[i] = req_vals[i];
+    }
+    // Take over from auto-video counters so a later clear doesn't confuse exit.
+    iris_memc_video_frames_ = 0;
+    iris_memc_novideo_frames_ = 0;
+  } else {
+    iris_memc_on_ = false;
+    iris_memc_off_pending_ = false;
+    iris_memc_request_driven_ = false;
+    iris_memc_request_nvals_ = 0;
+    iris_memc_off_time_ns_ = systemTime(SYSTEM_TIME_MONOTONIC);
+  }
+
+  // Compact log of the payload (up to 8 ints).
+  char payload[64] = {};
+  size_t off = 0;
+  for (size_t i = 0; i < vals.size() && off + 12 < sizeof(payload); i++) {
+    int w = snprintf(payload + off, sizeof(payload) - off, "%s%d",
+                     i ? "," : "", vals[i]);
+    if (w > 0) {
+      off += static_cast<size_t>(w);
+    }
+  }
+  DLOGI("Pxlw Iris7: memc_request %s irisConfigureSet(258, [%s]) status=%d (%s)",
+        do_on ? "ON" : "OFF", payload, status, reason);
+  return true;
+}
+
 void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   // Stock HWC owns MemcEn; type 258 alone without layers freezes. Layer identity is
   // wired; this is the minimal video enter/exit (SET_HDR_FORMAL / formal MEMC=10).
@@ -772,9 +1000,9 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
 
 bool HWCDisplayBuiltIn::CanApplyPendingConfig() {
   // Hold SF mode switches (UpdateActiveConfig AND SubmitDisplayConfig) while a MEMC
-  // session is live or unwinding. OFF is sent by MaybeRequestIrisVideoMemc when it
-  // sees pending_refresh_rate_config_ / pending_config_; the chip needs FRC2PT to
-  // finish before the DSI timing switch goes down.
+  // session is live or unwinding. OFF is sent by the request engine / auto-video
+  // path when it sees pending_refresh_rate_config_ / pending_config_; the chip
+  // needs FRC2PT to finish before the DSI timing switch goes down.
   if (iris_memc_on_) {
     if (callbacks_) {
       callbacks_->Refresh(id_);  // keep frames flowing so the OFF/unwind can progress
