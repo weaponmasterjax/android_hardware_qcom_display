@@ -901,10 +901,12 @@ bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
 void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   // Stock HWC owns MemcEn; type 258 alone without layers freezes. Layer identity is
   // wired; this is the minimal video enter/exit (SET_HDR_FORMAL / formal MEMC=10).
-  // Kill-switch: setprop persist.vendor.display.iris.auto_memc 0 — must still be
-  // able to exit an active MEMC session, so only bail early when already off.
+  // Gate: DeviceSettings' "Video enhancement" toggle sets
+  // persist.sys.display.iris.auto_memc (system-owned so coredomain may write it;
+  // 0 = off). Must still be able to exit an active MEMC session, so only bail
+  // early when already off.
   char prop[PROPERTY_VALUE_MAX] = {};
-  property_get("persist.vendor.display.iris.auto_memc", prop, "1");
+  property_get("persist.sys.display.iris.auto_memc", prop, "1");
   const bool kill = (prop[0] == '0');
   if (kill && !iris_memc_on_) {
     SetIrisVideoMemcPin(false);
