@@ -246,8 +246,8 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   static constexpr uint64_t kIrisDefaultBitClkHz = 1113600000ULL;
 
   // MEMC session state (shared by auto-video and the explicit request engine).
-  // Needs layer identity path + PT. Auto-video kill-switch:
-  // persist.vendor.display.iris.auto_memc=0. Explicit requests use
+  // Needs layer identity path + PT. Auto-video gate (DeviceSettings toggle):
+  // persist.sys.display.iris.auto_memc=0. Explicit requests use
   // sys.display.iris.memc_request and are not gated by auto_memc.
   bool iris_memc_on_ = false;
   bool iris_memc_off_pending_ = false;  // a kill/timing OFF was rejected; keep retrying
