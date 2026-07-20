@@ -197,6 +197,7 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   bool MaybeRequestIrisExplicitMemc();
   void MaybeRequestIrisVideoMemc();
   bool IrisVideoMemcEligible();
+  void SetIrisVideoMemcPin(bool on);
   bool CanApplyPendingConfig() override;
   void IrisNotifyDsiClkEnabled() override;
 #endif
@@ -256,6 +257,15 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
   uint32_t iris_memc_request_backoff_ = 0;  // presents to wait after a rejected request 258
   int iris_memc_last_config_ = -1;  // teardown/re-enter across timing switches
   nsecs_t iris_memc_off_time_ns_ = 0;  // last accepted 258-0, for the unwind hold
+
+  // Stable "fullscreen video is MEMC-eligible" latch, decoupled from the churny
+  // on/off state, published to vendor.display.iris.video_memc so the DeviceSettings
+  // policy can pin the panel at the FRC rate. SF must stop voting the content rate
+  // or every pending-rr tears the enter down, and the composer cannot pin
+  // Settings.System itself (that is a framework op — same lever the game path uses).
+  bool iris_video_pin_ = false;
+  uint32_t iris_video_pin_present_frames_ = 0;
+  uint32_t iris_video_pin_absent_frames_ = 0;
   // Last accepted request payload (for dedup / reconfigure). nvals==0 → none applied.
   static constexpr int kIrisMemcRequestMaxVals = 8;
   int32_t iris_memc_request_vals_[kIrisMemcRequestMaxVals] = {};

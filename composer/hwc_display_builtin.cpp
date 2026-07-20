@@ -672,6 +672,16 @@ bool HWCDisplayBuiltIn::IrisVideoMemcEligible() {
   return video_layers == 1 && video_area >= kIrisMemcMinVideoCoverage * display_area;
 }
 
+void HWCDisplayBuiltIn::SetIrisVideoMemcPin(bool on) {
+  if (iris_video_pin_ == on) {
+    return;
+  }
+  iris_video_pin_ = on;
+  property_set("vendor.display.iris.video_memc", on ? "1" : "0");
+  DLOGI("Pxlw Iris7: video-MEMC pin %s (policy pins RR at the FRC rate)",
+        on ? "ON" : "OFF");
+}
+
 namespace {
 // Parse sys.display.iris.memc_request into irisConfigureSet(258) payload.
 // Accepted: "" / "0" / "off" → off (return 0); "10,-1,50,-1,0,60" or space-separated.
@@ -897,13 +907,32 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   property_get("persist.vendor.display.iris.auto_memc", prop, "1");
   const bool kill = (prop[0] == '0');
   if (kill && !iris_memc_on_) {
+    SetIrisVideoMemcPin(false);
     return;
   }
 
   // Only touch MEMC once ABYP→PT completed (56 accepted) and no PT attempt is in
   // flight — after a PT give-up the chip is still in ABYP; 258 there is invalid.
   if (iris_pending_pt_ || !iris_pt_confirmed_) {
+    SetIrisVideoMemcPin(false);
     return;
+  }
+
+  // Publish a stable "fullscreen video eligible" signal, decoupled from the MEMC
+  // on/off churn below, so the DeviceSettings policy can pin the panel at the FRC
+  // rate BEFORE the enter. Without a pin SF keeps voting the content rate, and the
+  // timing-switch interlock below then tears every enter down (pending rr). Same
+  // enter/exit debounce as MEMC itself, but it does NOT reset on timing_changing.
+  if (!kill && IrisVideoMemcEligible()) {
+    iris_video_pin_absent_frames_ = 0;
+    if (++iris_video_pin_present_frames_ >= kIrisMemcEnterFrames) {
+      SetIrisVideoMemcPin(true);
+    }
+  } else {
+    iris_video_pin_present_frames_ = 0;
+    if (++iris_video_pin_absent_frames_ >= kIrisMemcExitFrames) {
+      SetIrisVideoMemcPin(false);
+    }
   }
 
   // Timing switches race the PT2MEMC arm: a 120→60 switch while FRC is live stalls
