@@ -754,13 +754,19 @@ bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
     return true;
   }
 
-  // Same timing-switch interlock as auto-video: never arm/reconfigure across a
-  // pending RR change; tear down first so CanApplyPendingConfig can release.
+  // Timing interlock (same policy as auto-video):
+  //  - Do not arm/reconfigure while a switch is still pending.
+  //  - A held SF RR vote is NOT a reason to tear down: CanApplyPendingConfig
+  //    keeps it queued until the request clears (or an applied switch leaks).
+  //  - Only an *applied* active-config change under live FRC forces OFF.
   const int active_config = GetActiveConfigIndex();
   const bool rr_pending = (pending_refresh_rate_config_ != UINT_MAX);
-  const bool timing_changing = pending_config_ || rr_pending ||
-                               (active_config != iris_memc_last_config_);
+  const bool config_pending = pending_config_;
+  const bool active_changed =
+      (iris_memc_last_config_ >= 0 && active_config != iris_memc_last_config_);
   iris_memc_last_config_ = active_config;
+  const bool enter_blocked = config_pending || rr_pending || active_changed;
+  const bool force_off_timing = active_changed;
 
   if (iris_memc_request_backoff_ > 0) {
     iris_memc_request_backoff_--;
@@ -771,14 +777,12 @@ bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
   bool do_on = false;
   const char *reason = "";
 
-  if (timing_changing) {
-    if (iris_memc_on_) {
-      do_off = true;
-      reason = rr_pending ? "pending rr" : "timing change";
-    } else {
-      // Wait for a stable window before (re)entering.
-      return true;
-    }
+  if (force_off_timing && iris_memc_on_) {
+    do_off = true;
+    reason = "timing applied";
+  } else if (enter_blocked && !iris_memc_on_) {
+    // Wait for a stable window before (re)entering.
+    return true;
   } else if (!want_on) {
     // Request cleared — OFF if we still believe MEMC is on (or a prior OFF failed).
     if (iris_memc_on_ || iris_memc_off_pending_) {
@@ -792,7 +796,7 @@ bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
   } else if (!iris_memc_on_) {
     // Enter (or retry after reject). No enter-frame hysteresis: policy is
     // responsible for RR pin / fps cap before writing the prop (stock shape).
-    if (iris_memc_request_backoff_ == 0) {
+    if (iris_memc_request_backoff_ == 0 && !enter_blocked) {
       do_on = true;
       reason = "request";
     }
@@ -800,12 +804,13 @@ bool HWCDisplayBuiltIn::MaybeRequestIrisExplicitMemc() {
                                        iris_memc_request_vals_,
                                        iris_memc_request_nvals_)) {
     // Already on — reconfigure when payload changes (fps/profile swap).
-    if (iris_memc_request_backoff_ == 0) {
+    // Skip reconfigure while a switch is pending (hold keeps active stable).
+    if (iris_memc_request_backoff_ == 0 && !enter_blocked) {
       do_on = true;
       reason = "reconfigure";
     }
   } else {
-    // Steady request-driven ON — nothing to do; keep suppressing auto-video.
+    // Steady request-driven ON — held SF RR votes stay queued under the hold.
     iris_memc_request_driven_ = true;
     return true;
   }
@@ -908,27 +913,32 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     return;
   }
 
-  // No DeviceSettings RR pin for video (that was a late reaction after eligibility
-  // and broke more than it helped). Enter only after kIrisMemcEnterFrames of stable
-  // fullscreen video with no timing_changing; once on, CanApplyPendingConfig holds
-  // SF VRR until OFF + unwind. Game path still pins 120 before memc_request.
+  // No DeviceSettings RR pin for video (late pin races FRC enter). Enter only
+  // after kIrisMemcEnterFrames of stable fullscreen video with no pending switch;
+  // once on, CanApplyPendingConfig holds SF VRR until video ends (OFF + unwind).
+  // Game path still pins 120 before memc_request.
+  //
+  // Held pending RR must NOT force OFF: SF routinely votes 60 for video content
+  // while peak is 120. Killing on rr_pending produced 120↔60 thrash (ON ~1s →
+  // OFF → apply 60 → back to 120 → ON). Hold queues the vote; OFF when video
+  // ends (or kill / applied timing leak) releases it — no deadlock.
 
-  // Timing switches race the PT2MEMC arm: a 120→60 switch while FRC is live stalls
-  // the encoder TE (wr_ptr/kickoff → HwRecovery). SubmitDisplayConfig is held while
-  // MEMC is on (CanApplyPendingConfig); that leaves pending_refresh_rate_config_
-  // set WITHOUT changing the active config — so we must treat a pending RR request
-  // as timing_changing here or OFF never fires and the hold deadlocks.
   const int active_config = GetActiveConfigIndex();
   const bool rr_pending = (pending_refresh_rate_config_ != UINT_MAX);
-  const bool timing_changing = pending_config_ || rr_pending ||
-                               (active_config != iris_memc_last_config_);
+  const bool config_pending = pending_config_;
+  const bool active_changed =
+      (iris_memc_last_config_ >= 0 && active_config != iris_memc_last_config_);
   iris_memc_last_config_ = active_config;
-  if (timing_changing) {
+  // Block new enters while a switch is pending or just applied.
+  const bool enter_blocked = config_pending || rr_pending || active_changed;
+  // Only an *applied* active-config change under live FRC is unsafe (panel TE
+  // stall / HwRecovery). Queued SF votes are held, not applied.
+  const bool force_off_timing = active_changed;
+
+  if (enter_blocked && !iris_memc_on_) {
     iris_memc_video_frames_ = 0;
     iris_memc_novideo_frames_ = 0;
-    if (!iris_memc_on_) {
-      return;
-    }
+    return;
   }
 
   const bool video = !kill && IrisVideoMemcEligible();
@@ -940,16 +950,14 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     iris_memc_video_frames_ = 0;
   }
 
-  const bool want_on = video && !iris_memc_on_ &&
+  const bool want_on = video && !iris_memc_on_ && !enter_blocked &&
                        iris_memc_video_frames_ >= kIrisMemcEnterFrames;
-  // A rejected kill/timing OFF must keep retrying even though timing_changing is a
-  // one-Present edge — otherwise a still-eligible video pins the stale ON until the
-  // video ends. Counters were zeroed on the failure, so this is a ~16-present backoff.
+  // Rejected kill/timing OFF must keep retrying (counters were zeroed on failure).
   const bool off_retry_due = iris_memc_off_pending_ &&
                              (iris_memc_video_frames_ >= kIrisMemcExitFrames ||
                               iris_memc_novideo_frames_ >= kIrisMemcExitFrames);
   const bool want_off = iris_memc_on_ &&
-                        (kill || timing_changing || off_retry_due ||
+                        (kill || force_off_timing || off_retry_due ||
                          (!video && iris_memc_novideo_frames_ >= kIrisMemcExitFrames));
   if (!want_on && !want_off) {
     return;
@@ -1000,19 +1008,19 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
         want_on ? "ON" : "OFF", vals[0], status,
         want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
         (want_off && kill) ? " (kill-switch)"
-                           : (want_off && rr_pending) ? " (pending rr)"
-                           : (want_off && timing_changing) ? " (timing change)"
-                           : (want_off && off_retry_due) ? " (off retry)" : "");
+                           : (want_off && force_off_timing) ? " (timing applied)"
+                           : (want_off && off_retry_due) ? " (off retry)"
+                           : (want_off && !video) ? " (no video)" : "");
 }
 
 bool HWCDisplayBuiltIn::CanApplyPendingConfig() {
   // Hold SF mode switches (UpdateActiveConfig AND SubmitDisplayConfig) while a MEMC
-  // session is live or unwinding. OFF is sent by the request engine / auto-video
-  // path when it sees pending_refresh_rate_config_ / pending_config_; the chip
-  // needs FRC2PT to finish before the DSI timing switch goes down.
+  // session is live or unwinding. Queued SF votes (often 60 during video) stay
+  // pending until auto-video / request engine OFF after the session ends; the chip
+  // needs FRC2PT to finish before any DSI timing switch goes down.
   if (iris_memc_on_) {
     if (callbacks_) {
-      callbacks_->Refresh(id_);  // keep frames flowing so the OFF/unwind can progress
+      callbacks_->Refresh(id_);  // keep frames flowing so session exit can progress
     }
     return false;
   }

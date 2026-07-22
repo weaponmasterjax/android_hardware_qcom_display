@@ -259,9 +259,10 @@ class HWCDisplayBuiltIn : public HWCDisplay, public SyncTask<LayerStitchTaskCode
 
   // Video MEMC does NOT pin Settings.System RR from DeviceSettings (late pin
   // races FRC enter). Ownership: auto_memc master toggle only in DS; enter waits
-  // for stable timing (kIrisMemcEnterFrames + timing_changing gate); once on,
-  // CanApplyPendingConfig holds SF VRR until OFF+unwind. Game MEMC still pins
-  // 120 in MemcGameService *before* memc_request.
+  // for stable timing (kIrisMemcEnterFrames, no pending switch); once on,
+  // CanApplyPendingConfig holds SF VRR until video ends (OFF+unwind). Held
+  // pending RR alone must not force OFF (that thrashed 120↔60). Game MEMC still
+  // pins 120 in MemcGameService *before* memc_request.
   // Last accepted request payload (for dedup / reconfigure). nvals==0 → none applied.
   static constexpr int kIrisMemcRequestMaxVals = 8;
   int32_t iris_memc_request_vals_[kIrisMemcRequestMaxVals] = {};
