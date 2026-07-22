@@ -1384,6 +1384,19 @@ void HWCLayer::SetComposition(const LayerComposition &sdm_composition) {
   }
   device_selected_ = hwc_composition;
 
+#ifdef PXLW_IRIS
+#ifdef SUPPORTS_PXLW_IRIS7
+  // Pixelworks LayerCompositionType: GPU=0, HWC=2 (types.hal).
+  if (display_id_ == 0) {
+    if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
+      int iris_comp = (hwc_composition == HWC2::Composition::Client) ? 0 : 2;
+      iris7->SetLayerCompositionType(static_cast<unsigned long>(display_id_),
+                                     static_cast<unsigned long>(id_), iris_comp);
+    }
+  }
+#endif
+#endif
+
   return;
 }
 
