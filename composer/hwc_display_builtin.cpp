@@ -969,15 +969,34 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     return;
   }
 
-  // irisConfig 258 4 <formal> -1 <scene> -1
-  // formal: HDR_FORMAL_MEMC=10, off=0; scene 0 = video. (Stock game profiles are
-  // per-title IMV commands 258-10-99-50-99-<sceneId>-<fps> — see memc.md §11.2.)
+  // irisConfig 258: formal / scene bitfield / optional gameApp / fps
+  // formal: HDR_FORMAL_MEMC=10, off=0.
+  // scene bitfield (parseHdrFormalSetting → setHdrFormalSetting):
+  //   bits 0-3  scene id — 1 = video allow=hasVideo (0 = strict 0x1ff mask; fails HDR)
+  //   bits 4-7  low-latency
+  //   bits 8-11 MEMC level — use 3 (kernel default for video; service level-0 was weak IQ)
+  //   bits 12-15 N2M
+  // values[5]=60 pins setGameFrameRate for the formal path (matches 60 fps content /
+  // panel 120 → ratio-60-120). Game IMV still uses memc_request, not this payload.
   android::hardware::hidl_vec<int32_t> vals;
-  vals.resize(4);
-  vals[0] = want_on ? 10 : 0;
-  vals[1] = -1;
-  vals[2] = 0;
-  vals[3] = -1;
+  if (want_on) {
+    constexpr int32_t kVideoScene = 1;
+    constexpr int32_t kMemcLevel = 3;
+    constexpr int32_t kSceneBitfield = kVideoScene | (kMemcLevel << 8);  // 0x301
+    vals.resize(6);
+    vals[0] = 10;
+    vals[1] = -1;
+    vals[2] = kSceneBitfield;
+    vals[3] = -1;
+    vals[4] = -1;
+    vals[5] = 60;
+  } else {
+    vals.resize(4);
+    vals[0] = 0;
+    vals[1] = -1;
+    vals[2] = 0;
+    vals[3] = -1;
+  }
   auto ret = iris->irisConfigureSet(258 /* SET_HDR_FORMAL */, vals);
   const int32_t status = ret.isOk() ? int32_t(ret) : INT32_MIN;
   if (status != 0) {
@@ -1003,9 +1022,10 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   if (want_off) {
     iris_memc_off_time_ns_ = systemTime(SYSTEM_TIME_MONOTONIC);
   }
-  DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0) status=%d "
-        "video_frames=%u%s",
-        want_on ? "ON" : "OFF", vals[0], status,
+  DLOGI("Pxlw Iris7: auto-MEMC %s irisConfigureSet(258, formal=%d scene=0x%x fps=%d) "
+        "status=%d video_frames=%u%s",
+        want_on ? "ON" : "OFF", vals[0], vals[2],
+        want_on && vals.size() > 5 ? vals[5] : 0, status,
         want_on ? iris_memc_video_frames_ : iris_memc_novideo_frames_,
         (want_off && kill) ? " (kill-switch)"
                            : (want_off && force_off_timing) ? " (timing applied)"
