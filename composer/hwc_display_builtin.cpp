@@ -941,7 +941,12 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     return;
   }
 
-  const bool video = !kill && IrisVideoMemcEligible();
+  // Auto video MEMC is SDR-only for now. HDR still satisfies IrisVideoMemcEligible()
+  // and the formal ON payload below still works for it — we just do not engage on
+  // HDR stacks (IQ / beams). Dropping hdr from "video" also forces OFF if content
+  // becomes HDR mid-session. Re-enable HDR by removing "&& !hdr_content".
+  const bool hdr_content = static_cast<bool>(layer_stack_.flags.hdr_present);
+  const bool video = !kill && IrisVideoMemcEligible() && !hdr_content;
   if (video) {
     iris_memc_video_frames_++;
     iris_memc_novideo_frames_ = 0;
@@ -978,6 +983,10 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
   //   bits 12-15 N2M
   // values[5]=60 pins setGameFrameRate for the formal path (matches 60 fps content /
   // panel 120 → ratio-60-120). Game IMV still uses memc_request, not this payload.
+  //
+  // HDR re-enable: this ON payload (formal=10 scene=0x301 fps=60) is what made HDR
+  // enter SINGLE-MEMC. It is intentionally left intact; only the SDR-only video
+  // gate above prevents the irisConfigureSet ON call for HDR content.
   android::hardware::hidl_vec<int32_t> vals;
   if (want_on) {
     constexpr int32_t kVideoScene = 1;
@@ -990,6 +999,11 @@ void HWCDisplayBuiltIn::MaybeRequestIrisVideoMemc() {
     vals[3] = -1;
     vals[4] = -1;
     vals[5] = 60;
+    // HDR ON was previously sent via the call below for any eligible video
+    // (including hdr_present). SDR-only policy: want_on is never true for HDR
+    // because of the !hdr_content gate. To re-engage HDR auto-MEMC, remove that
+    // gate — do not delete this payload.
+    // irisConfigureSet(258, formal=10 scene=0x301 fps=60)  // HDR path (disabled)
   } else {
     vals.resize(4);
     vals[0] = 0;
