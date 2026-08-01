@@ -419,50 +419,56 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
 
 #ifdef PXLW_IRIS
 #ifdef SUPPORTS_PXLW_IRIS7
+  // SUPPORTS_PXLW_IRIS7 is a build flag, not a hardware fact: soft-iris devices
+  // (no Iris in the display path) compile this in too, so every Iris 7P operation
+  // below has to sit behind the runtime wrapper check. The PT pre-arm in particular
+  // calls SetDynamicDSIClock() -- on a soft-iris panel that forces the bit-clk to a
+  // rate meant for the Ace 3's pass-through path, corrupting the display on wake.
   if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
     iris7->AfterSetPowerMode(static_cast<unsigned long>(id_), static_cast<int>(mode), teardown);
-  }
-  // Pre-arm Iris7P PT bit-clk after panel on. Kernel iris_abyp_switch_proc requires
-  // cached_clk_rate == bit_clk_list.rates[1] (1056000000 on Ace 3); without this,
-  // irisServiceModeSwitchBypassToPt times out and display stays SLEEP-ABYPASS.
-  // Dyn clock latches on subsequent commit (Present path).
-  if (mode == HWC2::PowerMode::On) {
-    std::vector<uint64_t> rates;
-    uint64_t target = kIrisPtBitClkHz;
-    if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
-      target = rates.size() > 1 ? rates[1] : rates.back();
+
+    // Pre-arm Iris7P PT bit-clk after panel on. Kernel iris_abyp_switch_proc requires
+    // cached_clk_rate == bit_clk_list.rates[1] (1056000000 on Ace 3); without this,
+    // irisServiceModeSwitchBypassToPt times out and display stays SLEEP-ABYPASS.
+    // Dyn clock latches on subsequent commit (Present path).
+    if (mode == HWC2::PowerMode::On) {
+      std::vector<uint64_t> rates;
+      uint64_t target = kIrisPtBitClkHz;
+      if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+        target = rates.size() > 1 ? rates[1] : rates.back();
+      }
+      DisplayError cerr = SetDynamicDSIClock(target);
+      DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
+      // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
+      iris_pending_pt_ = true;
+      iris_pt_requested_ = false;
+      iris_pt_confirmed_ = false;
+      iris_pt_present_count_ = 0;
+      iris_pt_phase_ = 0;
+      iris_pt_phase_frame_ = 0;
+      iris_pt_attempts_ = 0;
+    } else if (mode == HWC2::PowerMode::Off || mode == HWC2::PowerMode::DozeSuspend) {
+      iris_pending_pt_ = false;
+      iris_pt_requested_ = false;
+      iris_pt_confirmed_ = false;
+      iris_pt_present_count_ = 0;
+      iris_pt_phase_ = 0;
+      iris_pt_attempts_ = 0;
     }
-    DisplayError cerr = SetDynamicDSIClock(target);
-    DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
-    // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
-    iris_pending_pt_ = true;
-    iris_pt_requested_ = false;
-    iris_pt_confirmed_ = false;
-    iris_pt_present_count_ = 0;
-    iris_pt_phase_ = 0;
-    iris_pt_phase_frame_ = 0;
-    iris_pt_attempts_ = 0;
-  } else if (mode == HWC2::PowerMode::Off || mode == HWC2::PowerMode::DozeSuspend) {
-    iris_pending_pt_ = false;
-    iris_pt_requested_ = false;
-    iris_pt_confirmed_ = false;
-    iris_pt_present_count_ = 0;
-    iris_pt_phase_ = 0;
-    iris_pt_attempts_ = 0;
-  }
-  // Any transition away from On knocks the chip out of FRC (service resets on the
-  // power change) — drop MEMC bookkeeping so the next video/request session re-enters
-  // instead of trusting a stale ON flag. The request prop is left for userspace;
-  // on the next On+PT we re-apply it.
-  if (mode != HWC2::PowerMode::On) {
-    iris_memc_on_ = false;
-    iris_memc_off_pending_ = false;
-    iris_memc_request_driven_ = false;
-    iris_memc_off_time_ns_ = 0;
-    iris_memc_video_frames_ = 0;
-    iris_memc_novideo_frames_ = 0;
-    iris_memc_request_backoff_ = 0;
-    iris_memc_request_nvals_ = 0;
+    // Any transition away from On knocks the chip out of FRC (service resets on the
+    // power change) — drop MEMC bookkeeping so the next video/request session re-enters
+    // instead of trusting a stale ON flag. The request prop is left for userspace;
+    // on the next On+PT we re-apply it.
+    if (mode != HWC2::PowerMode::On) {
+      iris_memc_on_ = false;
+      iris_memc_off_pending_ = false;
+      iris_memc_request_driven_ = false;
+      iris_memc_off_time_ns_ = 0;
+      iris_memc_video_frames_ = 0;
+      iris_memc_novideo_frames_ = 0;
+      iris_memc_request_backoff_ = 0;
+      iris_memc_request_nvals_ = 0;
+    }
   }
 #endif
 #endif
@@ -520,12 +526,15 @@ HWC2::Error HWCDisplayBuiltIn::Present(shared_ptr<Fence> *out_retire_fence) {
           bool present_flag = false;
           iris7->Present(0, 0, present_flag, &layer_stack_);
           iris7->PresentDisplay(static_cast<unsigned long>(id_));
-        }
-        MaybeRequestIrisPt();
-        // Explicit request engine owns game/policy MEMC; suppresses auto-video
-        // while a request is active or a request-driven OFF is still in flight.
-        if (!MaybeRequestIrisExplicitMemc()) {
-          MaybeRequestIrisVideoMemc();
+          // Both drive the chip (PT bit-clk bounces, irisConfigureSet 56/258), so they
+          // belong inside the wrapper check -- MaybeRequestIrisPt() self-guards only on
+          // its own state flags, never on Iris being present.
+          MaybeRequestIrisPt();
+          // Explicit request engine owns game/policy MEMC; suppresses auto-video
+          // while a request is active or a request-driven OFF is still in flight.
+          if (!MaybeRequestIrisExplicitMemc()) {
+            MaybeRequestIrisVideoMemc();
+          }
         }
       }
 #endif
