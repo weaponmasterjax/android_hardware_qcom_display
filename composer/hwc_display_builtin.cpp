@@ -373,6 +373,9 @@ HWC2::Error HWCDisplayBuiltIn::CommitStitchLayers() {
 HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown) {
 #ifdef PXLW_IRIS
 #ifdef SUPPORTS_PXLW_IRIS7
+  // Capture before HWCDisplay::SetPowerMode overwrites current_power_mode_.
+  // Used to skip a redundant ABYP→PT re-arm on AOD (Doze) → On.
+  const HWC2::PowerMode prev_power_mode = current_power_mode_;
   // Notify Iris before panel power transition (stock HWCSessionIris7 / wrapper path).
   if (auto *iris7 = pxlw::AsIris7Wrapper(pxlw::PxlwIrisWrapper::GetInstance())) {
     iris7->BeforeSetPowerMode(static_cast<unsigned long>(id_), static_cast<int>(mode), teardown);
@@ -431,22 +434,35 @@ HWC2::Error HWCDisplayBuiltIn::SetPowerMode(HWC2::PowerMode mode, bool teardown)
     // cached_clk_rate == bit_clk_list.rates[1] (1056000000 on Ace 3); without this,
     // irisServiceModeSwitchBypassToPt times out and display stays SLEEP-ABYPASS.
     // Dyn clock latches on subsequent commit (Present path).
+    //
+    // AOD is PowerMode::Doze and leaves the chip in SINGLE-PT (Doze does not clear
+    // iris_pt_confirmed_). Unconditionally re-arming on every On was bouncing the
+    // DSI bit-clk (1113↔1056) + irisConfigureSet(56) on fingerprint unlock, racing
+    // the FP 120 Hz path and flashing a horizontal gray bar. Skip re-arm when we
+    // are already confirmed PT coming from Doze. Cold paths (Off / DozeSuspend /
+    // unconfirmed PT) still need the full sequence.
     if (mode == HWC2::PowerMode::On) {
-      std::vector<uint64_t> rates;
-      uint64_t target = kIrisPtBitClkHz;
-      if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
-        target = rates.size() > 1 ? rates[1] : rates.back();
+      const bool skip_pt_rearm = (prev_power_mode == HWC2::PowerMode::Doze) &&
+                                 iris_pt_confirmed_ && !iris_pending_pt_;
+      if (skip_pt_rearm) {
+        DLOGI("Pxlw Iris7: skip auto-PT re-arm on Doze→On (PT already confirmed)");
+      } else {
+        std::vector<uint64_t> rates;
+        uint64_t target = kIrisPtBitClkHz;
+        if (GetSupportedDSIClock(&rates) == kErrorNone && !rates.empty()) {
+          target = rates.size() > 1 ? rates[1] : rates.back();
+        }
+        DisplayError cerr = SetDynamicDSIClock(target);
+        DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
+        // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
+        iris_pending_pt_ = true;
+        iris_pt_requested_ = false;
+        iris_pt_confirmed_ = false;
+        iris_pt_present_count_ = 0;
+        iris_pt_phase_ = 0;
+        iris_pt_phase_frame_ = 0;
+        iris_pt_attempts_ = 0;
       }
-      DisplayError cerr = SetDynamicDSIClock(target);
-      DLOGI("Pxlw Iris7: post-On SetDynamicDSIClock target=%" PRIu64 " err=%d", target, cerr);
-      // Defer irisConfigureSet(56,0) until dyn bit-clk has really latched in kernel.
-      iris_pending_pt_ = true;
-      iris_pt_requested_ = false;
-      iris_pt_confirmed_ = false;
-      iris_pt_present_count_ = 0;
-      iris_pt_phase_ = 0;
-      iris_pt_phase_frame_ = 0;
-      iris_pt_attempts_ = 0;
     } else if (mode == HWC2::PowerMode::Off || mode == HWC2::PowerMode::DozeSuspend) {
       iris_pending_pt_ = false;
       iris_pt_requested_ = false;
